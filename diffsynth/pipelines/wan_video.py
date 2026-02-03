@@ -534,6 +534,11 @@ class WanVideoPipeline(BasePipeline):
         self.h_offsets = h_offsets
         self.w_offsets = w_offsets
         self.linear_indices = linear_indices
+        self.num_tiles_h = num_tiles_h
+        self.num_tiles_w = num_tiles_w
+        self.tile_h = tile_h
+        self.tile_w = tile_w
+        self.half_l = half_l
         self.indices_computed = True
     
     
@@ -654,7 +659,7 @@ class WanVideoPipeline(BasePipeline):
         vace_video_mask=None,
         vace_reference_image=None,
         vace_scale=1.0,
-        denoising_strength=0.82,
+        denoising_strength=0.92,
         seed=None,
         rand_device="cpu",
         height=480,
@@ -694,7 +699,15 @@ class WanVideoPipeline(BasePipeline):
         
         # Parameter check
         height, width = self.check_resize_height_width(height, width)
-        if num_frames % 4 != 1:
+
+        # Auto-infer num_frames from input_video if provided
+        if input_video is not None:
+            inferred_frames = len(input_video)
+            if num_frames != inferred_frames:
+                print(f"num_frames auto-adjusted from {num_frames} to {inferred_frames} based on input_video length.")
+                num_frames = inferred_frames
+            # Skip num_frames adjustment when input_video is provided (latent frames determined by video)
+        elif num_frames % 4 != 1:
             num_frames = (num_frames + 2) // 4 * 4 + 1
             print(f"Only `num_frames % 4 != 1` is acceptable. We round it up to {num_frames}.")
         
@@ -797,7 +810,7 @@ class WanVideoPipeline(BasePipeline):
                 start_event_gen.record()
             for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
                 timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
-                if mode != 'No_transfer' and i_for_guidance < 20:
+                if mode != 'No_transfer' and i_for_guidance < 10:
                     if test_latency:
                         start_event_guidance[i_for_guidance].record()
                     

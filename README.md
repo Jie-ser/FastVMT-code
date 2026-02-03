@@ -53,7 +53,7 @@ https://github.com/user-attachments/assets/a4c0a8e5-578a-4534-93aa-c1a1960edb37
 
 - **Attention Motion Flow (AMF)**: Custom implementation for transferring motion patterns from reference videos to generated content
 - **Efficient Tile-based AMF**: Optimized computation with reduced memory usage while maintaining accuracy
-- **Flexible Inference Modes**: Support for multiple generation modes (`effi_AMF`, `AMF`, `No_transfer`)
+- **Flexible Inference Modes**: Support for multiple generation modes (`effi_AMF`, `No_transfer`)
 - **VRAM Management**: Built-in CPU offload strategies for running on consumer GPUs
 
 ## 🛡 Setup Environment
@@ -78,42 +78,86 @@ pip install -e . # Editing mode
 
 ## 📥 Model Download
 
-Download the Wan2.1-T2V-14B model:
+We support two model variants:
 
-<details><summary>Click for the bash command:</summary>
+| Model | VRAM Required | Quality |
+|-------|---------------|---------|
+| Wan2.1-T2V-1.3B | ~24GB | Good |
+| Wan2.1-T2V-14B | ~80GB | Best |
+
+### Using download script (Recommended)
 
 ```bash
-# Using ModelScope CLI
-pip install modelscope
+# Download 14B model (default, best quality)
+python examples/download_model.py --model 14b
+
+# Download 1.3B model (lower VRAM requirement)
+python examples/download_model.py --model 1.3b
+
+# Download both models
+python examples/download_model.py --model all
+```
+
+<details><summary>Or use ModelScope CLI directly:</summary>
+
+```bash
+# Download 14B model
 modelscope download --model Wan-AI/Wan2.1-T2V-14B --local_dir ./models/Wan2.1-T2V-14B
+
+# Download 1.3B model
+modelscope download --model Wan-AI/Wan2.1-T2V-1.3B --local_dir ./models/Wan2.1-T2V-1.3B
 ```
 
 </details>
 
-Or use the download script:
-
-```python
-python examples/download_model.py
-```
-
 ## ⚔️ FastVMT Editing
 
-#### Video-to-Video with Motion Transfer
+#### Quick Start
+
+```bash
+# Using 1.3B model (lower VRAM)
+python examples/wan_1.3b_text_to_video.py --input_video your_video.mp4 --mode effi_AMF
+
+# Using 14B model (better quality)
+python examples/wan_14b_text_to_video.py --input_video your_video.mp4 --mode effi_AMF
+
+# With custom resolution and denoising strength
+python examples/wan_1.3b_text_to_video.py --input_video your_video.mp4 --height 368 --width 640 --denoising_strength 0.75
+```
+
+#### Python API
 
 ```python
-from diffsynth import VideoData
+import torch
+from diffsynth import ModelManager, WanVideoPipeline, save_video, VideoData
+
+# Load models
+model_manager = ModelManager(device="cpu")
+model_manager.load_models([
+    "models/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors",
+    "models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
+    "models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+], torch_dtype=torch.bfloat16)
+
+pipe = WanVideoPipeline.from_model_manager(model_manager, torch_dtype=torch.bfloat16, device="cuda")
+pipe.enable_vram_management(num_persistent_param_in_dit=None)
 
 # Load reference video for motion transfer
-ref_video = VideoData("./data/reference.mp4", height=480, width=832)
+ref_video = VideoData("your_video.mp4", height=480, width=832)
 
-# Generate with motion transfer
+# Generate with motion transfer (num_frames auto-inferred from input_video)
 video = pipe(
     prompt="Your text prompt",
+    negative_prompt="low quality, blurry",
+    num_inference_steps=50,
+    denoising_strength=1.0,
     input_video=ref_video,
-    num_frames=81,
+    seed=42,
+    tiled=True,
+    sf=4,
     mode="effi_AMF",
-    sf=4  # Frame distance for motion computation
 )
+save_video(video, "output.mp4", fps=15, quality=5)
 ```
 
 #### Motion Transfer Modes

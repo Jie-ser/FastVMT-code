@@ -1,8 +1,6 @@
 import torch
 from diffsynth import ModelManager, WanVideoPipeline, save_video, VideoData
-from modelscope import snapshot_download
-import os, re
-import argparse
+import os, re, argparse
 
 
 # Default model paths
@@ -47,14 +45,14 @@ def main(args):
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
 
 
-    video = VideoData("/path/to/reference_video.mp4", height=480, width=832)
+    video = VideoData(args.input_video, height=args.height, width=args.width)
     # Text-to-video
     video = pipe(
         prompt="Documentary photography style. A lively puppy running quickly on a green grass field. The puppy has brown-yellow fur, ears perked up, with a focused and joyful expression. Sunlight shines on it, making the fur look extra soft and shiny. The background is an open grass field, occasionally dotted with wildflowers, with blue sky and white clouds visible in the distance. Strong perspective, capturing the puppy's dynamic movement and the vitality of the surrounding grass. Medium shot, side tracking view.",
         negative_prompt="vivid colors, overexposed, static, blurry details, subtitles, stylized, artwork, painting, still image, overall gray, worst quality, low quality, JPEG artifacts, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, malformed limbs, fused fingers, static frame, cluttered background, three legs, many people in background, walking backwards",
         num_inference_steps=50,
+        denoising_strength=args.denoising_strength,
         input_video=video,
-        input_video_path = "/path/to/reference_video.mp4",
         seed=args.seed,
         tiled=True,
         num_frames=41,
@@ -70,12 +68,17 @@ if __name__ == "__main__":
     parser.add_argument("--model_dir", type=str, default=DEFAULT_MODEL_DIR,
                         help="Directory containing model files (default: models/Wan2.1-T2V-1.3B)")
     parser.add_argument("--output_dir", type=str, default="results", help="Directory to save output videos")
+    parser.add_argument("--input_video", type=str, default="data/reference.mp4",
+                        help="Path to reference video for motion transfer")
+    parser.add_argument("--height", type=int, default=480, help="Output video height (default: 480)")
+    parser.add_argument("--width", type=int, default=832, help="Output video width (default: 832)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--use_tile", action="store_true", help="Use tiled processing for large videos")
-    parser.add_argument("--sf", type=int, default=5, help="Spatial factor for AMF computation (default: 1)")
+    parser.add_argument("--sf", type=int, default=4, help="Spatial factor for AMF computation (default: 4)")
     parser.add_argument("--test_latency", action="store_true", help="Test latency of the model")
     parser.add_argument("--latency_dir", type=str, default=None, help="Directory to save latency logs")
-    parser.add_argument("--mode", type=str, default=None, choices=['No_transfer', 'AMF', 'effi_AMF'],help="Mode for the video generation, e.g., 'No_transfer'")
+    parser.add_argument("--mode", type=str, default="effi_AMF", choices=['No_transfer', 'effi_AMF'],help="Mode for the video generation")
+    parser.add_argument("--denoising_strength", type=float, default=1.0, help="Denoising strength (default: 1.0)")
     args = parser.parse_args()
 
     # Set output directory

@@ -8,6 +8,7 @@ safetensors
 transformers>=4.40.0
 sentencepiece
 protobuf
+ftfy
 
 # Video I/O
 imageio
