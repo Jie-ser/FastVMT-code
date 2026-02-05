@@ -116,13 +116,10 @@ modelscope download --model Wan-AI/Wan2.1-T2V-1.3B --local_dir ./models/Wan2.1-T
 
 ```bash
 # Using 1.3B model (lower VRAM)
-python examples/wan_1.3b_text_to_video.py --input_video your_video.mp4 --mode effi_AMF
+python examples/wan_1.3b_text_to_video.py
 
 # Using 14B model (better quality)
-python examples/wan_14b_text_to_video.py --input_video your_video.mp4 --mode effi_AMF
-
-# With custom resolution and denoising strength
-python examples/wan_1.3b_text_to_video.py --input_video your_video.mp4 --height 368 --width 640 --denoising_strength 0.75
+python examples/wan_14b_text_to_video.py
 ```
 
 #### Python API
@@ -143,14 +140,14 @@ pipe = WanVideoPipeline.from_model_manager(model_manager, torch_dtype=torch.bflo
 pipe.enable_vram_management(num_persistent_param_in_dit=None)
 
 # Load reference video for motion transfer
-ref_video = VideoData("your_video.mp4", height=480, width=832)
+ref_video = VideoData("data/source.mp4", height=480, width=832)
 
 # Generate with motion transfer (num_frames auto-inferred from input_video)
 video = pipe(
-    prompt="Your text prompt",
+    prompt="Documentary photography style. A lively puppy running quickly on a green grass field. The puppy has brown-yellow fur, ears perked up, with a focused and joyful expression. Sunlight shines on it, making the fur look extra soft and shiny. The background is an open grass field, occasionally dotted with wildflowers, with blue sky and white clouds visible in the distance. Strong perspective, capturing the puppy's dynamic movement and the vitality of the surrounding grass. Medium shot, side tracking view.",
     negative_prompt="low quality, blurry",
     num_inference_steps=50,
-    denoising_strength=1.0,
+    denoising_strength=0.75,
     input_video=ref_video,
     seed=42,
     tiled=True,

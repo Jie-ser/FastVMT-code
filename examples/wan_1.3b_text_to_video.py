@@ -55,7 +55,7 @@ def main(args):
         input_video=video,
         seed=args.seed,
         tiled=True,
-        num_frames=41,
+        num_frames=81,
         sf=args.sf,
         test_latency=args.test_latency,
         latency_dir=args.latency_dir,
@@ -68,7 +68,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_dir", type=str, default=DEFAULT_MODEL_DIR,
                         help="Directory containing model files (default: models/Wan2.1-T2V-1.3B)")
     parser.add_argument("--output_dir", type=str, default="results", help="Directory to save output videos")
-    parser.add_argument("--input_video", type=str, default="data/reference.mp4",
+    parser.add_argument("--input_video", type=str, default="data/source.mp4",
                         help="Path to reference video for motion transfer")
     parser.add_argument("--height", type=int, default=480, help="Output video height (default: 480)")
     parser.add_argument("--width", type=int, default=832, help="Output video width (default: 832)")
@@ -78,7 +78,7 @@ if __name__ == "__main__":
     parser.add_argument("--test_latency", action="store_true", help="Test latency of the model")
     parser.add_argument("--latency_dir", type=str, default=None, help="Directory to save latency logs")
     parser.add_argument("--mode", type=str, default="effi_AMF", choices=['No_transfer', 'effi_AMF'],help="Mode for the video generation")
-    parser.add_argument("--denoising_strength", type=float, default=1.0, help="Denoising strength (default: 1.0)")
+    parser.add_argument("--denoising_strength", type=float, default=0.75, help="Denoising strength (default: 1.0)")
     args = parser.parse_args()
 
     # Set output directory
