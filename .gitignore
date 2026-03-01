@@ -222,3 +222,7 @@ results/
 *.bin
 
 
+
+# large media
+*.mp4
+
