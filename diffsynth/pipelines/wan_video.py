@@ -547,6 +547,109 @@ class WanVideoPipeline(BasePipeline):
         gc.collect()
         torch.cuda.empty_cache()
         gc.collect()  
+
+    def _resolve_ttc_indices(self, timesteps, ttc_noise_levels=(500, 250), ttc_step_ratios=(0.5, 0.25)):
+        # Convert to a detached CPU tensor so index search is deterministic and cheap.
+        if not isinstance(timesteps, torch.Tensor):
+            timesteps = torch.tensor(timesteps, dtype=torch.float32)
+        ts = timesteps.detach().float().cpu()
+        num_steps = int(ts.shape[0])
+        indices = []
+
+        # Primary strategy: map requested TTC noise levels (e.g. 500/250) to nearest scheduler steps.
+        for noise_level in ttc_noise_levels or []:
+            target = float(noise_level)
+            idx = int(torch.argmin((ts - target).abs()).item())
+            # Exclude the last step because TTC needs a valid "next" timestep (j + 1).
+            if 0 <= idx < num_steps - 1:
+                indices.append(idx)
+
+        # Fallback strategy: use ratios of the starting timestep if explicit levels do not match.
+        if len(indices) == 0:
+            t_start = float(ts[0].item())
+            for ratio in ttc_step_ratios or []:
+                target = t_start * float(ratio)
+                idx = int(torch.argmin((ts - target).abs()).item())
+                if 0 <= idx < num_steps - 1:
+                    indices.append(idx)
+
+        return sorted(set(indices))
+
+    def _get_ttc_anchor(self, ttc_anchor_clean, input_video, x0_pred):
+        # Reuse cached anchor once created so the anchor remains stable across TTC hits.
+        if ttc_anchor_clean is not None:
+            return ttc_anchor_clean
+        # For video-conditioned generation, anchor from the clean first-frame latent of input video.
+        if input_video is not None and hasattr(self, "clean_latents") and self.clean_latents is not None:
+            return self.clean_latents[:, :, :1].clone().detach()
+        # For text-only generation, use the current x0 first-frame prediction as anchor.
+        return x0_pred[:, :, :1].clone().detach()
+
+    def _inject_anchor_on_noisy_latents(self, latents_noisy, anchor_clean, timestep_next, blend=1.0, rand_device="cpu"):
+        # Keep blend in [0, 1] to avoid invalid interpolation weights.
+        blend = float(max(0.0, min(1.0, blend)))
+        # Map clean anchor to the same noise level as latents_next before blending.
+        anchor_noise = self.generate_noise(anchor_clean.shape, device=rand_device, dtype=torch.float32)
+        anchor_noise = anchor_noise.to(dtype=self.torch_dtype, device=self.device)
+        anchor_noisy = self.scheduler.add_noise(anchor_clean, anchor_noise, timestep=timestep_next)
+        latents_noisy = latents_noisy.clone()
+        # Only inject on the first temporal slice; other frames stay unchanged.
+        latents_noisy[:, :, :1] = (1 - blend) * latents_noisy[:, :, :1] + blend * anchor_noisy
+        return latents_noisy
+
+    def _ttc_pathwise_update(
+        self,
+        latents: torch.Tensor,
+        current_timestep: torch.Tensor,
+        next_timestep: torch.Tensor,
+        current_noise_pred: torch.Tensor,
+        prompt_emb_posi,
+        prompt_emb_nega,
+        cfg_scale: float,
+        image_emb: dict,
+        extra_input: dict,
+        size_info: dict,
+        usp_kwargs: dict,
+        motion_kwargs: dict,
+        vace_kwargs: dict,
+        ttc_anchor_clean: torch.Tensor,
+        ttc_anchor_blend: float = 1.0,
+        rand_device: str = "cpu",
+    ):
+        # Step A: estimate current clean latent x0 from current step prediction.
+        x0_current = self.scheduler.step(current_noise_pred, current_timestep, latents, to_final=True)
+        # Step B: resample to next timestep noise level to construct TTC correction state.
+        noise_1 = self.generate_noise(latents.shape, device=rand_device, dtype=torch.float32)
+        noise_1 = noise_1.to(dtype=self.torch_dtype, device=self.device)
+        latents_next = self.scheduler.add_noise(x0_current, noise_1, timestep=next_timestep)
+        latents_next = self._inject_anchor_on_noisy_latents(
+            latents_next, ttc_anchor_clean, timestep_next=next_timestep, blend=ttc_anchor_blend, rand_device=rand_device
+        )
+
+        # Step C: run model at next timestep on corrected state; disable TeaCache to avoid cache-step mismatch.
+        noise_pred_posi = model_fn_wan_video(
+            self.dit, motion_controller=self.motion_controller, vace=self.vace,
+            x=latents_next, timestep=next_timestep, size_info=size_info,
+            **prompt_emb_posi, **image_emb, **extra_input,
+            tea_cache=None, **usp_kwargs, **motion_kwargs, **vace_kwargs,
+        )
+        if cfg_scale != 1.0:
+            noise_pred_nega = model_fn_wan_video(
+                self.dit, motion_controller=self.motion_controller, vace=self.vace,
+                x=latents_next, timestep=next_timestep, size_info=size_info,
+                **prompt_emb_nega, **image_emb, **extra_input,
+                tea_cache=None, **usp_kwargs, **motion_kwargs, **vace_kwargs,
+            )
+            noise_pred_corr = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
+        else:
+            noise_pred_corr = noise_pred_posi
+
+        # Step D: project corrected prediction back to x0, then sample a final latent at next timestep.
+        x0_corr = self.scheduler.step(noise_pred_corr, next_timestep, latents_next, to_final=True)
+        noise_2 = self.generate_noise(latents.shape, device=rand_device, dtype=torch.float32)
+        noise_2 = noise_2.to(dtype=self.torch_dtype, device=self.device)
+        latents_next = self.scheduler.add_noise(x0_corr, noise_2, timestep=next_timestep)
+        return latents_next
         
     def guidance_step(self, 
                       latents: torch.Tensor, 
@@ -680,6 +783,12 @@ class WanVideoPipeline(BasePipeline):
         test_latency=False,
         latency_dir=None,
         mode=None,
+        ttc_enabled=False,
+        ttc_noise_levels=(500, 250),
+        ttc_step_ratios=(0.5, 0.25),
+        ttc_anchor_blend=1.0,
+        ttc_debug=False,
+        guidance_steps=10,
     ):
         self.indices_computed = False
         self.indices_expanded = []
@@ -752,6 +861,7 @@ class WanVideoPipeline(BasePipeline):
         self.load_models_to_device(["text_encoder"])
         prompt_emb_posi = self.encode_prompt(prompt, positive=True)
         prompt_null = self.encode_prompt("", positive=True)
+        prompt_emb_nega = None
         if cfg_scale != 1.0:
             prompt_emb_nega = self.encode_prompt(negative_prompt, positive=False)
             
@@ -788,6 +898,15 @@ class WanVideoPipeline(BasePipeline):
         
         # Unified Sequence Parallel
         usp_kwargs = self.prepare_unified_sequence_parallel()
+        # Default empty set keeps TTC branch disabled unless explicitly enabled and resolved below.
+        ttc_indices = set()
+        if ttc_enabled and mode != 'No_transfer':
+            # Resolve TTC trigger steps once before denoising loop.
+            ttc_indices = set(self._resolve_ttc_indices(self.scheduler.timesteps, ttc_noise_levels, ttc_step_ratios))
+            if ttc_debug:
+                # Print both indices and actual timestep values for quick verification.
+                resolved_timesteps = [float(self.scheduler.timesteps[i].item()) for i in sorted(ttc_indices)]
+                print(f"TTC enabled. Step indices: {sorted(ttc_indices)}, timesteps: {resolved_timesteps}")
 
 
         #start_event = torch.cuda.Event(enable_timing=True)
@@ -801,6 +920,7 @@ class WanVideoPipeline(BasePipeline):
 
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self.device).type):
             i_for_guidance = 0
+            ttc_anchor_clean = None
             if test_latency:
                 start_event_guidance = [torch.cuda.Event(enable_timing=True) for _ in range(10)]
                 start_event_gen = torch.cuda.Event(enable_timing=True)
@@ -810,7 +930,7 @@ class WanVideoPipeline(BasePipeline):
                 start_event_gen.record()
             for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
                 timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
-                if mode != 'No_transfer' and i_for_guidance < 10:
+                if mode != 'No_transfer' and i_for_guidance < guidance_steps:
                     if test_latency:
                         start_event_guidance[i_for_guidance].record()
                     
@@ -840,6 +960,30 @@ class WanVideoPipeline(BasePipeline):
                 else:
                     noise_pred = noise_pred_posi
 
+                if ttc_enabled and mode != 'No_transfer' and progress_id in ttc_indices and progress_id + 1 < len(self.scheduler.timesteps):
+                    x0_current = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], latents, to_final=True)
+                    ttc_anchor_clean = self._get_ttc_anchor(ttc_anchor_clean, input_video, x0_current)
+                    next_timestep = self.scheduler.timesteps[progress_id + 1].unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
+                    latents = self._ttc_pathwise_update(
+                        latents=latents,
+                        current_timestep=timestep,
+                        next_timestep=next_timestep,
+                        current_noise_pred=noise_pred,
+                        prompt_emb_posi=prompt_emb_posi,
+                        prompt_emb_nega=prompt_emb_nega,
+                        cfg_scale=cfg_scale,
+                        image_emb=image_emb,
+                        extra_input=extra_input,
+                        size_info=size_info,
+                        usp_kwargs=usp_kwargs,
+                        motion_kwargs=motion_kwargs,
+                        vace_kwargs=vace_kwargs,
+                        ttc_anchor_clean=ttc_anchor_clean,
+                        ttc_anchor_blend=ttc_anchor_blend,
+                        rand_device=rand_device,
+                    )
+                    continue
+
                 # Scheduler
                 latents = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], latents)
             self.clean_memory()
@@ -859,7 +1003,9 @@ class WanVideoPipeline(BasePipeline):
         if vace_reference_image is not None:
             latents = latents[:, :, 1:]
         
-        del prompt_emb_posi, prompt_null, prompt_emb_nega
+        del prompt_emb_posi, prompt_null
+        if prompt_emb_nega is not None:
+            del prompt_emb_nega
         #del self.dit, self.motion_controller, self.vace
         self.clean_memory()
         # Decode

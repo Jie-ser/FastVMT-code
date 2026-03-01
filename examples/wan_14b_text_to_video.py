@@ -53,20 +53,27 @@ def main(args):
     pipe.enable_vram_management(num_persistent_param_in_dit=None) # You can set `num_persistent_param_in_dit` to a small number to reduce VRAM required.
 
     video = VideoData(args.input_video, height=args.height, width=args.width)
+    #video.set_length(args.num_frames) #此行开启后，必须保证输入视频帧数和num_frames一致，否则会报错。
     # Text-to-video with motion transfer
     video = pipe(
         prompt="Documentary photography style. A lively puppy running quickly on a green grass field. The puppy has brown-yellow fur, ears perked up, with a focused and joyful expression. Sunlight shines on it, making the fur look extra soft and shiny. The background is an open grass field, occasionally dotted with wildflowers, with blue sky and white clouds visible in the distance. Strong perspective, capturing the puppy's dynamic movement and the vitality of the surrounding grass. Medium shot, side tracking view.",
         negative_prompt="vivid colors, overexposed, static, blurry details, subtitles, stylized, artwork, painting, still image, overall gray, worst quality, low quality, JPEG artifacts, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, malformed limbs, fused fingers, static frame, cluttered background, three legs, many people in background, walking backwards",
-        num_inference_steps=50,
+        num_inference_steps=args.num_inference_steps,
         denoising_strength=args.denoising_strength,
         input_video=video,
         seed=args.seed, 
         tiled=True,
-        num_frames=81,
+        num_frames=args.num_frames,
         sf=args.sf,
         test_latency=args.test_latency,
         latency_dir=args.latency_dir,
         mode=args.mode,
+        ttc_enabled=args.ttc_enabled,
+        ttc_noise_levels=tuple(args.ttc_noise_levels),
+        ttc_step_ratios=tuple(args.ttc_step_ratios),
+        ttc_anchor_blend=args.ttc_anchor_blend,
+        ttc_debug=args.ttc_debug,
+        guidance_steps=args.guidance_steps,
     )
     save_video(video, get_next_video_path(output_dir=args.output_dir), fps=15, quality=5)
 
@@ -84,6 +91,14 @@ if __name__ == "__main__":
     parser.add_argument("--test_latency", action="store_true", help="Test latency of the model")
     parser.add_argument("--latency_dir", type=str, default=None, help="Directory to save latency logs")
     parser.add_argument("--mode", type=str, default="effi_AMF", choices=['No_transfer', 'effi_AMF'],help="Mode for the video generation")
+    parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to load/use")
+    parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of denoising steps")
+    parser.add_argument("--guidance_steps", type=int, default=10, help="How many early steps run AMF guidance (set 0 for low-VRAM smoke test)")
+    parser.add_argument("--ttc_enabled", action="store_true", help="Enable path-wise test-time correction")
+    parser.add_argument("--ttc_noise_levels", type=int, nargs="+", default=[500, 250], help="TTC target noise levels")
+    parser.add_argument("--ttc_step_ratios", type=float, nargs="+", default=[0.5, 0.25], help="TTC fallback ratios if noise-level mapping fails")
+    parser.add_argument("--ttc_anchor_blend", type=float, default=1.0, help="Blend factor for TTC anchor injection")
+    parser.add_argument("--ttc_debug", action="store_true", help="Print resolved TTC step indices")
     parser.add_argument("--denoising_strength", type=float, default=0.75, help="Denoising strength (default: 1.0)")
     args = parser.parse_args()
     
