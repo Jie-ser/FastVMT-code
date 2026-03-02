@@ -15,6 +15,20 @@ DEFAULT_DIT_MODELS = [
 ]
 DEFAULT_T5_MODEL = "models_t5_umt5-xxl-enc-bf16.pth"
 DEFAULT_VAE_MODEL = "Wan2.1_VAE.pth"
+DEFAULT_PROMPT = (
+    "Documentary photography style. A lively puppy running quickly on a green grass field. "
+    "The puppy has brown-yellow fur, ears perked up, with a focused and joyful expression. "
+    "Sunlight shines on it, making the fur look extra soft and shiny. The background is an open "
+    "grass field, occasionally dotted with wildflowers, with blue sky and white clouds visible in "
+    "the distance. Strong perspective, capturing the puppy's dynamic movement and the vitality of "
+    "the surrounding grass. Medium shot, side tracking view."
+)
+DEFAULT_NEGATIVE_PROMPT = (
+    "vivid colors, overexposed, static, blurry details, subtitles, stylized, artwork, painting, "
+    "still image, overall gray, worst quality, low quality, JPEG artifacts, ugly, incomplete, extra "
+    "fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, malformed limbs, fused "
+    "fingers, static frame, cluttered background, three legs, many people in background, walking backwards"
+)
 
 
 def get_model_paths(model_dir):
@@ -56,8 +70,8 @@ def main(args):
     #video.set_length(args.num_frames) #此行开启后，必须保证输入视频帧数和num_frames一致，否则会报错。
     # Text-to-video with motion transfer
     video = pipe(
-        prompt="Documentary photography style. A lively puppy running quickly on a green grass field. The puppy has brown-yellow fur, ears perked up, with a focused and joyful expression. Sunlight shines on it, making the fur look extra soft and shiny. The background is an open grass field, occasionally dotted with wildflowers, with blue sky and white clouds visible in the distance. Strong perspective, capturing the puppy's dynamic movement and the vitality of the surrounding grass. Medium shot, side tracking view.",
-        negative_prompt="vivid colors, overexposed, static, blurry details, subtitles, stylized, artwork, painting, still image, overall gray, worst quality, low quality, JPEG artifacts, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, malformed limbs, fused fingers, static frame, cluttered background, three legs, many people in background, walking backwards",
+        prompt=args.prompt,
+        negative_prompt=args.negative_prompt,
         num_inference_steps=args.num_inference_steps,
         denoising_strength=args.denoising_strength,
         input_video=video,
@@ -93,6 +107,8 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default="effi_AMF", choices=['No_transfer', 'effi_AMF'],help="Mode for the video generation")
     parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to load/use")
     parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of denoising steps")
+    parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT, help="Text prompt for generation")
+    parser.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT, help="Negative prompt for generation")
     parser.add_argument("--guidance_steps", type=int, default=10, help="How many early steps run AMF guidance (set 0 for low-VRAM smoke test)")
     parser.add_argument("--ttc_enabled", action="store_true", help="Enable path-wise test-time correction")
     parser.add_argument("--ttc_noise_levels", type=int, nargs="+", default=[500, 250], help="TTC target noise levels")
