@@ -575,15 +575,35 @@ class WanVideoPipeline(BasePipeline):
 
         return sorted(set(indices))
 
-    def _get_ttc_anchor(self, ttc_anchor_clean, input_video, x0_pred):
+    def _get_ttc_anchor(
+        self,
+        ttc_anchor_clean,
+        input_video,
+        x0_pred,
+        ttc_anchor_mode="hybrid",
+        ttc_anchor_ref_weight=0.25,
+    ):
         # Reuse cached anchor once created so the anchor remains stable across TTC hits.
         if ttc_anchor_clean is not None:
             return ttc_anchor_clean
-        # For video-conditioned generation, anchor from the clean first-frame latent of input video.
+
+        mode = str(ttc_anchor_mode).strip().lower()
+        pred_anchor = x0_pred[:, :, :1].clone().detach()
+
+        ref_anchor = None
         if input_video is not None and hasattr(self, "clean_latents") and self.clean_latents is not None:
-            return self.clean_latents[:, :, :1].clone().detach()
-        # For text-only generation, use the current x0 first-frame prediction as anchor.
-        return x0_pred[:, :, :1].clone().detach()
+            ref_anchor = self.clean_latents[:, :, :1].clone().detach()
+
+        if mode == "legacy_input_clean":
+            return ref_anchor if ref_anchor is not None else pred_anchor
+        if mode == "pred_x0":
+            return pred_anchor
+        if mode == "hybrid":
+            if ref_anchor is None:
+                return pred_anchor
+            ref_w = float(max(0.0, min(1.0, ttc_anchor_ref_weight)))
+            return ref_w * ref_anchor + (1.0 - ref_w) * pred_anchor
+        raise ValueError("Invalid ttc_anchor_mode. Expected one of: legacy_input_clean, pred_x0, hybrid")
 
     def _inject_anchor_on_noisy_latents(self, latents_noisy, anchor_clean, timestep_next, blend=1.0, rand_device="cpu"):
         # Keep blend in [0, 1] to avoid invalid interpolation weights.
@@ -787,6 +807,10 @@ class WanVideoPipeline(BasePipeline):
         ttc_noise_levels=(500, 250),
         ttc_step_ratios=(0.5, 0.25),
         ttc_anchor_blend=1.0,
+        ttc_anchor_mode="hybrid",
+        ttc_anchor_ref_weight=0.25,
+        ttc_anchor_blend_start=None,
+        ttc_anchor_blend_end=None,
         ttc_debug=False,
         guidance_steps=10,
     ):
@@ -900,6 +924,11 @@ class WanVideoPipeline(BasePipeline):
         usp_kwargs = self.prepare_unified_sequence_parallel()
         # Default empty set keeps TTC branch disabled unless explicitly enabled and resolved below.
         ttc_indices = set()
+        # New TTC blend schedule with backward-compatible fallback to legacy single blend.
+        ttc_blend_start = ttc_anchor_blend if ttc_anchor_blend_start is None else float(ttc_anchor_blend_start)
+        ttc_blend_end = ttc_blend_start if ttc_anchor_blend_end is None else float(ttc_anchor_blend_end)
+        ttc_blend_start = float(max(0.0, min(1.0, ttc_blend_start)))
+        ttc_blend_end = float(max(0.0, min(1.0, ttc_blend_end)))
         if ttc_enabled and mode != 'No_transfer':
             # Resolve TTC trigger steps once before denoising loop.
             ttc_indices = set(self._resolve_ttc_indices(self.scheduler.timesteps, ttc_noise_levels, ttc_step_ratios))
@@ -907,6 +936,10 @@ class WanVideoPipeline(BasePipeline):
                 # Print both indices and actual timestep values for quick verification.
                 resolved_timesteps = [float(self.scheduler.timesteps[i].item()) for i in sorted(ttc_indices)]
                 print(f"TTC enabled. Step indices: {sorted(ttc_indices)}, timesteps: {resolved_timesteps}")
+                print(
+                    f"TTC anchor config: mode={ttc_anchor_mode}, ref_weight={ttc_anchor_ref_weight}, "
+                    f"blend_start={ttc_blend_start}, blend_end={ttc_blend_end}"
+                )
 
 
         #start_event = torch.cuda.Event(enable_timing=True)
@@ -921,6 +954,8 @@ class WanVideoPipeline(BasePipeline):
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self.device).type):
             i_for_guidance = 0
             ttc_anchor_clean = None
+            ttc_total_hits = len(ttc_indices)
+            ttc_hit_count = 0
             if test_latency:
                 start_event_guidance = [torch.cuda.Event(enable_timing=True) for _ in range(10)]
                 start_event_gen = torch.cuda.Event(enable_timing=True)
@@ -961,9 +996,22 @@ class WanVideoPipeline(BasePipeline):
                     noise_pred = noise_pred_posi
 
                 if ttc_enabled and mode != 'No_transfer' and progress_id in ttc_indices and progress_id + 1 < len(self.scheduler.timesteps):
+                    if ttc_total_hits <= 1:
+                        current_ttc_blend = ttc_blend_start
+                    else:
+                        blend_alpha = float(ttc_hit_count) / float(ttc_total_hits - 1)
+                        current_ttc_blend = ttc_blend_start + (ttc_blend_end - ttc_blend_start) * blend_alpha
+
                     x0_current = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], latents, to_final=True)
-                    ttc_anchor_clean = self._get_ttc_anchor(ttc_anchor_clean, input_video, x0_current)
+                    ttc_anchor_clean = self._get_ttc_anchor(
+                        ttc_anchor_clean, input_video, x0_current, ttc_anchor_mode, ttc_anchor_ref_weight
+                    )
                     next_timestep = self.scheduler.timesteps[progress_id + 1].unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
+                    if ttc_debug:
+                        print(
+                            f"TTC hit {ttc_hit_count + 1}/{ttc_total_hits} at step={progress_id}, "
+                            f"t={float(self.scheduler.timesteps[progress_id].item()):.4f}, blend={current_ttc_blend:.4f}"
+                        )
                     latents = self._ttc_pathwise_update(
                         latents=latents,
                         current_timestep=timestep,
@@ -979,9 +1027,10 @@ class WanVideoPipeline(BasePipeline):
                         motion_kwargs=motion_kwargs,
                         vace_kwargs=vace_kwargs,
                         ttc_anchor_clean=ttc_anchor_clean,
-                        ttc_anchor_blend=ttc_anchor_blend,
+                        ttc_anchor_blend=current_ttc_blend,
                         rand_device=rand_device,
                     )
+                    ttc_hit_count += 1
                     continue
 
                 # Scheduler

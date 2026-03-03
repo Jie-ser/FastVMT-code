@@ -79,6 +79,10 @@ def main(args):
         ttc_noise_levels=tuple(args.ttc_noise_levels),
         ttc_step_ratios=tuple(args.ttc_step_ratios),
         ttc_anchor_blend=args.ttc_anchor_blend,
+        ttc_anchor_mode=args.ttc_anchor_mode,
+        ttc_anchor_ref_weight=args.ttc_anchor_ref_weight,
+        ttc_anchor_blend_start=args.ttc_anchor_blend_start,
+        ttc_anchor_blend_end=args.ttc_anchor_blend_end,
         ttc_debug=args.ttc_debug,
         guidance_steps=args.guidance_steps,
     )
@@ -107,7 +111,11 @@ if __name__ == "__main__":
     parser.add_argument("--ttc_enabled", action="store_true", help="Enable path-wise test-time correction")
     parser.add_argument("--ttc_noise_levels", type=int, nargs="+", default=[500, 250], help="TTC target noise levels")
     parser.add_argument("--ttc_step_ratios", type=float, nargs="+", default=[0.5, 0.25], help="TTC fallback ratios if noise-level mapping fails")
-    parser.add_argument("--ttc_anchor_blend", type=float, default=1.0, help="Blend factor for TTC anchor injection")
+    parser.add_argument("--ttc_anchor_blend", type=float, default=1.0, help="Legacy fixed blend fallback when TTC blend schedule is not set")
+    parser.add_argument("--ttc_anchor_mode", type=str, default="hybrid", choices=["legacy_input_clean", "pred_x0", "hybrid"], help="Anchor source for TTC first-frame correction")
+    parser.add_argument("--ttc_anchor_ref_weight", type=float, default=0.25, help="Reference-frame weight used only when --ttc_anchor_mode=hybrid")
+    parser.add_argument("--ttc_anchor_blend_start", type=float, default=0.35, help="TTC anchor blend at the first TTC hit")
+    parser.add_argument("--ttc_anchor_blend_end", type=float, default=0.12, help="TTC anchor blend at the last TTC hit")
     parser.add_argument("--ttc_debug", action="store_true", help="Print resolved TTC step indices")
     parser.add_argument("--denoising_strength", type=float, default=0.75, help="Denoising strength (default: 1.0)")
     args = parser.parse_args()
