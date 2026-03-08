@@ -670,6 +670,39 @@ class WanVideoPipeline(BasePipeline):
         noise_2 = noise_2.to(dtype=self.torch_dtype, device=self.device)
         latents_next = self.scheduler.add_noise(x0_corr, noise_2, timestep=next_timestep)
         return latents_next
+
+    def _compute_msa_velocity_loss(self, velocity_opt, velocity_anchor, msa_mask=None):
+        anchor = velocity_anchor.detach()
+        if msa_mask is not None:
+            diff = (velocity_opt - anchor) * msa_mask
+        else:
+            diff = velocity_opt - anchor
+        return torch.mean(diff.float() * diff.float())
+
+    def _build_msa_mask(self, amf_ref_orin, target_shape, size_info, msa_mask_mode="uniform", msa_mask_power=1.0, msa_mask_min=0.15):
+        b, _, _, h, w = target_shape
+        if msa_mask_mode == "uniform" or amf_ref_orin is None:
+            return torch.ones((b, 1, 1, h, w), dtype=self.torch_dtype, device=self.device)
+
+        try:
+            spatial_mag = torch.linalg.vector_norm(amf_ref_orin.float(), ord=2, dim=-1).mean(dim=0)
+            low_h, low_w = int(size_info["tile_size"][0]), int(size_info["tile_size"][1])
+            if low_h * low_w != spatial_mag.numel():
+                raise ValueError("AMF spatial shape does not match tile_size.")
+
+            mask = spatial_mag.view(1, 1, low_h, low_w)
+            mask = mask - mask.amin(dim=(-2, -1), keepdim=True)
+            mask = mask / mask.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+            mask = torch.pow(mask.clamp(min=0.0), float(msa_mask_power))
+            mask = mask * (1.0 - float(msa_mask_min)) + float(msa_mask_min)
+            mask = F.interpolate(mask, size=(h, w), mode="bilinear", align_corners=False)
+            mask = mask.unsqueeze(2).to(dtype=self.torch_dtype, device=self.device)
+            if b > 1:
+                mask = mask.expand(b, -1, -1, -1, -1)
+            return mask
+        except Exception:
+            # Fallback keeps optimization stable when AMF mask inference fails.
+            return torch.ones((b, 1, 1, h, w), dtype=self.torch_dtype, device=self.device)
         
     def guidance_step(self, 
                       latents: torch.Tensor, 
@@ -684,15 +717,33 @@ class WanVideoPipeline(BasePipeline):
                       mode, 
                       seed,
                       step_id,
-                      interval: int=3
+                      interval: int=3,
+                      msa_enabled: bool=False,
+                      msa_optim_start: int=0,
+                      msa_optim_end: int=1,
+                      msa_iter: int=2,
+                      msa_scale_list=(50.0, 300.0),
+                      msa_mask_mode: str="uniform",
+                      msa_mask_power: float=1.0,
+                      msa_mask_min: float=0.15,
+                      msa_balance_with_amf: bool=True,
+                      msa_debug: bool=False,
                       ) -> torch.Tensor:
         # Do the guidance step to optimize the latent representation.
         
         # Initialize the learning rate
         self.clean_memory()
         initial_lr = 0.003  
-        final_lr = 0.002   
-        total_steps = 10   # total optimization steps
+        final_lr = 0.002
+        default_total_steps = 10
+        msa_step_active = (
+            bool(msa_enabled)
+            and hasattr(self, "clean_latents")
+            and self.clean_latents is not None
+            and int(msa_optim_start) <= int(step_id) <= int(msa_optim_end)
+        )
+        total_steps = int(max(1, msa_iter if msa_step_active else default_total_steps))
+        effective_interval = 1 if msa_step_active else max(1, int(interval))
         current_step = 0    # current optimization step
         
         for i, block in enumerate(self.dit.blocks):  
@@ -708,12 +759,24 @@ class WanVideoPipeline(BasePipeline):
         # initialize the optimizer with the optimized_latents
         
         self.scale_range = np.linspace(0.007 , 0.004, 50)#[0.007 , 0.004],50,self.scale_range = np.linspace(config["scale_range"][0], config["scale_range"][1], len(self.guidance_schedule))
+
+        msa_anchor_velocity = None
+        msa_mask = None
+        msa_scale = None
+        if msa_step_active:
+            local_msa_step_id = int(step_id) - int(msa_optim_start)
+            if local_msa_step_id < 0 or local_msa_step_id >= len(msa_scale_list):
+                msa_step_active = False
+                if msa_debug:
+                    print(f"MSA disabled at step={step_id}: scale list index {local_msa_step_id} is out of range.")
+            else:
+                msa_scale = float(msa_scale_list[local_msa_step_id])
         
         with torch.no_grad(): # disable the gradient computation to calculate reference of the ref video
             noise = self.generate_noise(latents.shape, device=latents.device, dtype=torch.float32, seed=seed)
             noise = noise.to(dtype=self.torch_dtype, device=self.device)
             ref_latents = self.scheduler.add_noise(self.clean_latents, noise, timestep=timestep)
-            _ = self.dit(ref_latents, timestep=timestep, preserve_space=True, size_info=size_info, **prompt_null, **image_emb, **extra_input)
+            ref_velocity = self.dit(ref_latents, timestep=timestep, preserve_space=True, size_info=size_info, **prompt_null, **image_emb, **extra_input)
             num_blocks = len(self.dit.blocks)
             print(f"Total number of blocks: {num_blocks}")
             for i, block in enumerate(self.dit.blocks):  # retrieve the index using enumerate
@@ -723,9 +786,26 @@ class WanVideoPipeline(BasePipeline):
                     q_q = self_attn.q_reshape  # retrieve self.q_q
                     break  # quitting the loop after finding the 15th block
             if mode == 'effi_AMF':
-                amf, _ = self.compute_tile_AMF(q_q,k_k,sf=sf, l=21, tau=1.0, tile=(3, 4))
+                amf, _ = self.compute_tile_AMF(q_q, k_k, sf=sf, l=21, tau=1.0, tile=(3, 4))
             else:
                 raise ValueError('Please set a valid mode to generate videos')
+
+            if msa_step_active:
+                msa_anchor_velocity = ref_velocity.detach()
+                msa_mask = self._build_msa_mask(
+                    amf,
+                    target_shape=latents.shape,
+                    size_info=size_info,
+                    msa_mask_mode=msa_mask_mode,
+                    msa_mask_power=msa_mask_power,
+                    msa_mask_min=msa_mask_min,
+                )
+                if msa_debug:
+                    print(
+                        f"MSA active at step={step_id}: iter={total_steps}, scale={msa_scale:.4f}, "
+                        f"mask_mode={msa_mask_mode}, mask_min={float(msa_mask.min().item()):.4f}, "
+                        f"mask_max={float(msa_mask.max().item()):.4f}"
+                    )
             
         # Compute AMF of the generated latent
         
@@ -742,8 +822,8 @@ class WanVideoPipeline(BasePipeline):
                     self.dit.train()
                     for param in self.dit.parameters():
                         param.requires_grad_(False)
-                    if j % interval == 0 or mode == 'AMF':
-                        _ = self.dit(optimized_latents, timestep=timestep, size_info=size_info, preserve_space=True, **detached_prompt_emb_posi_new, **image_emb, **extra_input)
+                    if j % effective_interval == 0 or mode == 'AMF':
+                        pred_velocity = self.dit(optimized_latents, timestep=timestep, size_info=size_info, preserve_space=True, **detached_prompt_emb_posi_new, **image_emb, **extra_input)
 
                         for i, block in enumerate(self.dit.blocks):  
             
@@ -755,7 +835,24 @@ class WanVideoPipeline(BasePipeline):
                         if mode == 'effi_AMF':
                             amf_new, track_loss = self.compute_tile_AMF(q_q_new,k_k_new,sf=sf, l=21, tau=1.0, tile=(3, 4))
                             amf_loss = self.compute_tile_amf_loss(amf, amf_new)
-                            loss =  5*amf_loss + track_loss
+                            loss_core = 5 * amf_loss + track_loss
+                            if msa_step_active and msa_anchor_velocity is not None and msa_scale is not None:
+                                msa_loss = self._compute_msa_velocity_loss(pred_velocity, msa_anchor_velocity, msa_mask)
+                                if msa_balance_with_amf:
+                                    balance = (loss_core.detach().abs() / msa_loss.detach().abs().clamp_min(1e-6)).clamp(min=0.05, max=20.0)
+                                    msa_weight = float(msa_scale) * balance
+                                else:
+                                    msa_weight = float(msa_scale)
+                                loss = loss_core + msa_weight * msa_loss
+                                if msa_debug and (j == 0 or j == total_steps - 1):
+                                    print(
+                                        f"MSA debug step={step_id}, iter={j + 1}/{total_steps}: "
+                                        f"amf={float(amf_loss.detach().item()):.6f}, "
+                                        f"track={float(track_loss.detach().item()):.6f}, "
+                                        f"msa={float(msa_loss.detach().item()):.6f}"
+                                    )
+                            else:
+                                loss = loss_core
                     else:
                         loss = (optimized_latents * self.cached_grad).sum()
 
@@ -813,6 +910,16 @@ class WanVideoPipeline(BasePipeline):
         ttc_anchor_blend_end=None,
         ttc_debug=False,
         guidance_steps=10,
+        msa_enabled=False,
+        msa_optim_start=0,
+        msa_optim_end=1,
+        msa_iter=2,
+        msa_scale_list=(50.0, 300.0),
+        msa_mask_mode="uniform",
+        msa_mask_power=1.0,
+        msa_mask_min=0.15,
+        msa_balance_with_amf=True,
+        msa_debug=False,
     ):
         self.indices_computed = False
         self.indices_expanded = []
@@ -829,6 +936,48 @@ class WanVideoPipeline(BasePipeline):
             print('You are using the MOFT mode, which uses the MOtion FeaTure to transfer the motion.')
         else:
             raise ValueError('Please set a valid mode to generate videos')
+
+        msa_mask_mode = str(msa_mask_mode).strip().lower()
+        if msa_mask_mode not in ["uniform", "amf"]:
+            raise ValueError("msa_mask_mode must be one of: uniform, amf")
+        msa_mask_power = float(max(0.1, msa_mask_power))
+        msa_mask_min = float(max(0.0, min(1.0, msa_mask_min)))
+        msa_iter = int(max(1, msa_iter))
+        msa_balance_with_amf = bool(msa_balance_with_amf)
+        msa_enabled = bool(msa_enabled)
+        msa_scale_list = tuple(float(scale) for scale in msa_scale_list)
+
+        if msa_enabled and mode == 'No_transfer':
+            print("MSA is disabled because `mode='No_transfer'`.")
+            msa_enabled = False
+        if msa_enabled and guidance_steps <= 0:
+            print("MSA is disabled because `guidance_steps <= 0`.")
+            msa_enabled = False
+        if msa_enabled and input_video is None:
+            print("MSA is disabled because reference `input_video` is required for MSA anchor.")
+            msa_enabled = False
+
+        max_guidance_index = max(0, int(guidance_steps) - 1)
+        msa_optim_start = int(max(0, msa_optim_start))
+        msa_optim_end = int(max(0, msa_optim_end))
+        msa_optim_start = min(msa_optim_start, max_guidance_index)
+        msa_optim_end = min(msa_optim_end, max_guidance_index)
+        if msa_enabled and msa_optim_end < msa_optim_start:
+            print("MSA is disabled because `msa_optim_end < msa_optim_start` after clamping.")
+            msa_enabled = False
+        if msa_enabled:
+            expected_msa_scales = msa_optim_end - msa_optim_start + 1
+            if len(msa_scale_list) != expected_msa_scales:
+                raise ValueError(
+                    f"Expected {expected_msa_scales} msa_scale values for step range "
+                    f"[{msa_optim_start}, {msa_optim_end}], but got {len(msa_scale_list)}."
+                )
+            if msa_debug:
+                print(
+                    f"MSA config: range=[{msa_optim_start}, {msa_optim_end}], iter={msa_iter}, "
+                    f"mask={msa_mask_mode}, power={msa_mask_power}, min={msa_mask_min}, "
+                    f"balance_with_amf={msa_balance_with_amf}, scales={msa_scale_list}"
+                )
         
         # Parameter check
         height, width = self.check_resize_height_width(height, width)
@@ -970,11 +1119,19 @@ class WanVideoPipeline(BasePipeline):
                         start_event_guidance[i_for_guidance].record()
                     
                         latents = self.guidance_step(latents, timestep,prompt_emb_posi,prompt_null,image_emb,extra_input,noise,size_info, 
-                                                 sf=sf, mode=mode, seed=seed, interval=3, step_id=progress_id)
+                                                 sf=sf, mode=mode, seed=seed, interval=3, step_id=progress_id,
+                                                 msa_enabled=msa_enabled, msa_optim_start=msa_optim_start, msa_optim_end=msa_optim_end,
+                                                 msa_iter=msa_iter, msa_scale_list=msa_scale_list, msa_mask_mode=msa_mask_mode,
+                                                 msa_mask_power=msa_mask_power, msa_mask_min=msa_mask_min,
+                                                 msa_balance_with_amf=msa_balance_with_amf, msa_debug=msa_debug)
                         end_event_guidance[i_for_guidance].record()
                     else:
                         latents = self.guidance_step(latents, timestep,prompt_emb_posi,prompt_null,image_emb,extra_input,noise,size_info,
-                                                 sf=sf, mode=mode, seed=seed, interval=3, step_id=progress_id)
+                                                 sf=sf, mode=mode, seed=seed, interval=3, step_id=progress_id,
+                                                 msa_enabled=msa_enabled, msa_optim_start=msa_optim_start, msa_optim_end=msa_optim_end,
+                                                 msa_iter=msa_iter, msa_scale_list=msa_scale_list, msa_mask_mode=msa_mask_mode,
+                                                 msa_mask_power=msa_mask_power, msa_mask_min=msa_mask_min,
+                                                 msa_balance_with_amf=msa_balance_with_amf, msa_debug=msa_debug)
                     i_for_guidance += 1
 
                 # Inference

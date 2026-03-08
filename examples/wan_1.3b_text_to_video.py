@@ -85,6 +85,16 @@ def main(args):
         ttc_anchor_blend_end=args.ttc_anchor_blend_end,
         ttc_debug=args.ttc_debug,
         guidance_steps=args.guidance_steps,
+        msa_enabled=args.msa_enabled,
+        msa_optim_start=args.msa_optim_start,
+        msa_optim_end=args.msa_optim_end,
+        msa_iter=args.msa_iter,
+        msa_scale_list=tuple(args.msa_scale_list),
+        msa_mask_mode=args.msa_mask_mode,
+        msa_mask_power=args.msa_mask_power,
+        msa_mask_min=args.msa_mask_min,
+        msa_balance_with_amf=args.msa_balance_with_amf,
+        msa_debug=args.msa_debug,
     )
     save_video(video, get_next_video_path(output_dir=args.output_dir), fps=15, quality=5)
 
@@ -108,6 +118,16 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT, help="Text prompt for generation")
     parser.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT, help="Negative prompt for generation")
     parser.add_argument("--guidance_steps", type=int, default=10, help="How many early steps run AMF guidance (set 0 for low-VRAM smoke test)")
+    parser.add_argument("--msa_enabled", action="store_true", help="Enable Video-MSA early structure guidance")
+    parser.add_argument("--msa_optim_start", type=int, default=0, help="First guidance step index where MSA is enabled")
+    parser.add_argument("--msa_optim_end", type=int, default=1, help="Last guidance step index where MSA is enabled")
+    parser.add_argument("--msa_iter", type=int, default=2, help="Number of latent optimization iterations per MSA-enabled guidance step")
+    parser.add_argument("--msa_scale_list", type=float, nargs="+", default=[50.0, 300.0], help="Per-step MSA scales for [msa_optim_start, msa_optim_end]")
+    parser.add_argument("--msa_mask_mode", type=str, default="uniform", choices=["uniform", "amf"], help="MSA spatial mask mode")
+    parser.add_argument("--msa_mask_power", type=float, default=1.0, help="Power applied to AMF-derived MSA mask")
+    parser.add_argument("--msa_mask_min", type=float, default=0.15, help="Minimum mask weight for MSA to avoid vanishing gradients")
+    parser.add_argument("--msa_balance_with_amf", action=argparse.BooleanOptionalAction, default=True, help="Dynamically balance MSA loss scale with AMF loss magnitude")
+    parser.add_argument("--msa_debug", action="store_true", help="Print MSA debug logs")
     parser.add_argument("--ttc_enabled", action="store_true", help="Enable path-wise test-time correction")
     parser.add_argument("--ttc_noise_levels", type=int, nargs="+", default=[500, 250], help="TTC target noise levels")
     parser.add_argument("--ttc_step_ratios", type=float, nargs="+", default=[0.5, 0.25], help="TTC fallback ratios if noise-level mapping fails")
