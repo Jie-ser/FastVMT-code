@@ -1,9 +1,21 @@
+import argparse
+import os
+import re
+from pathlib import Path
+
 import torch
-from diffsynth import ModelManager, WanVideoPipeline, save_video, VideoData
-import os, re, argparse
+
+from diffsynth import (
+    ModelManager,
+    VideoData,
+    WanVideoPipeline,
+    apply_benchmark_settings,
+    build_run_metadata,
+    save_video,
+    write_metadata,
+)
 
 
-# Default model paths
 DEFAULT_MODEL_DIR = "models/Wan2.1-T2V-14B"
 DEFAULT_DIT_MODELS = [
     "diffusion_pytorch_model-00001-of-00006.safetensors",
@@ -31,9 +43,8 @@ DEFAULT_NEGATIVE_PROMPT = (
 )
 
 
-def get_model_paths(model_dir):
-    """Get model paths from the specified directory."""
-    dit_paths = [os.path.join(model_dir, m) for m in DEFAULT_DIT_MODELS]
+def discover_model_paths(model_dir):
+    dit_paths = [os.path.join(model_dir, model_name) for model_name in DEFAULT_DIT_MODELS]
     return [
         dit_paths,
         os.path.join(model_dir, DEFAULT_T5_MODEL),
@@ -41,46 +52,62 @@ def get_model_paths(model_dir):
     ]
 
 
+def get_model_paths(model_dir):
+    return discover_model_paths(model_dir)
+
+
 def get_next_video_path(output_dir="results", prefix="video", ext=".mp4"):
-    """
-    Find all prefixN.ext files in output_dir and return the next available path.
-    For example, if video1.mp4 and video2.mp4 exist, returns results/video3.mp4
-    """
     os.makedirs(output_dir, exist_ok=True)
     pattern = re.compile(rf"^{re.escape(prefix)}(\d+){re.escape(ext)}$")
     nums = []
     for fn in os.listdir(output_dir):
-        m = pattern.match(fn)
-        if m:
-            nums.append(int(m.group(1)))
+        match = pattern.match(fn)
+        if match:
+            nums.append(int(match.group(1)))
     next_num = max(nums) + 1 if nums else 1
     return os.path.join(output_dir, f"{prefix}{next_num}{ext}")
-def main(args):
-    # Load models
-    model_manager = ModelManager(device="cpu")
-    model_paths = get_model_paths(args.model_dir)
-    model_manager.load_models(
-        model_paths,
-        torch_dtype=torch.bfloat16, # You can set `torch_dtype=torch.float8_e4m3fn` to enable FP8 quantization.
-    )
-    pipe = WanVideoPipeline.from_model_manager(model_manager, torch_dtype=torch.bfloat16, device="cuda")
-    pipe.enable_vram_management(num_persistent_param_in_dit=None) # You can set `num_persistent_param_in_dit` to a small number to reduce VRAM required.
 
-    video = VideoData(args.input_video, height=args.height, width=args.width)
-    #video.set_length(args.num_frames) #此行开启后，必须保证输入视频帧数和num_frames一致，否则会报错。
-    # Text-to-video with motion transfer
-    video = pipe(
+
+def main(args):
+    settings = apply_benchmark_settings(
+        height=args.height,
+        width=args.width,
+        num_frames=args.num_frames,
+        num_inference_steps=args.num_inference_steps,
+        benchmark_preset=args.benchmark_preset,
+    )
+
+    model_manager = ModelManager(device="cpu")
+    model_manager.load_models(discover_model_paths(args.model_dir), torch_dtype=torch.bfloat16)
+    pipe = WanVideoPipeline.from_model_manager(model_manager, torch_dtype=torch.bfloat16, device="cuda")
+    pipe.enable_vram_management(num_persistent_param_in_dit=None)
+
+    input_video = VideoData(args.input_video, height=settings["height"], width=settings["width"])
+    if args.benchmark_preset is not None:
+        available_frames = len(input_video)
+        if available_frames < settings["num_frames"]:
+            raise ValueError(
+                f"Reference video only has {available_frames} frames, but benchmark_preset "
+                f"`{args.benchmark_preset}` requires {settings['num_frames']} frames."
+            )
+        input_video.set_length(settings["num_frames"])
+
+    frames = pipe(
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
-        num_inference_steps=args.num_inference_steps,
+        num_inference_steps=settings["num_inference_steps"],
         denoising_strength=args.denoising_strength,
-        input_video=video,
-        seed=args.seed, 
+        input_video=input_video,
+        seed=args.seed,
         tiled=True,
-        num_frames=args.num_frames,
+        height=settings["height"],
+        width=settings["width"],
+        num_frames=settings["num_frames"],
         sf=args.sf,
         test_latency=args.test_latency,
         latency_dir=args.latency_dir,
+        transfer_method=args.transfer_method,
+        benchmark_preset=args.benchmark_preset,
         mode=args.mode,
         ttc_enabled=args.ttc_enabled,
         ttc_noise_levels=tuple(args.ttc_noise_levels),
@@ -103,57 +130,95 @@ def main(args):
         msa_balance_with_amf=args.msa_balance_with_amf,
         msa_debug=args.msa_debug,
     )
-    save_video(video, get_next_video_path(output_dir=args.output_dir), fps=15, quality=5)
+    output_path = get_next_video_path(output_dir=args.output_dir)
+    save_video(frames, output_path, fps=15, quality=5)
+
+    summary = pipe.last_run_summary or {}
+    metadata = build_run_metadata(
+        prompt=args.prompt,
+        negative_prompt=args.negative_prompt,
+        ref_video=args.input_video,
+        output_path=output_path,
+        seed=args.seed,
+        steps=summary.get("num_inference_steps", settings["num_inference_steps"]),
+        frames=summary.get("output_num_frames", summary.get("num_frames", len(frames))),
+        height=summary.get("height", settings["height"]),
+        width=summary.get("width", settings["width"]),
+        method=summary.get("transfer_method", args.transfer_method or args.mode or "fastvmt"),
+        model_variant=settings.get("model_variant", "Wan2.1-T2V-14B"),
+        benchmark_preset=args.benchmark_preset,
+        extra={
+            "requested_num_frames": summary.get("requested_num_frames", settings["num_frames"]),
+            "decoded_num_frames": summary.get("decoded_num_frames", len(frames)),
+            "output_num_frames": summary.get("output_num_frames", len(frames)),
+        },
+    )
+    write_metadata(Path(output_path).with_suffix(".json"), metadata)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WanVideo Text-to-Video Example")
-    parser.add_argument("--model_dir", type=str, default=DEFAULT_MODEL_DIR,
-                        help="Directory containing model files (default: models/Wan2.1-T2V-14B)")
-    parser.add_argument("--output_dir", type=str, default="results", help="Directory to save output videos")
-    parser.add_argument("--input_video", type=str, default="data/source.mp4",
-                        help="Path to reference video for motion transfer")
-    parser.add_argument("--height", type=int, default=480, help="Output video height (default: 480)")
-    parser.add_argument("--width", type=int, default=832, help="Output video width (default: 832)")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--sf", type=int, default=4, help="Spatial factor for AMF computation (default: 1)")
-    parser.add_argument("--test_latency", action="store_true", help="Test latency of the model")
-    parser.add_argument("--latency_dir", type=str, default=None, help="Directory to save latency logs")
-    parser.add_argument("--mode", type=str, default="effi_AMF", choices=['No_transfer', 'effi_AMF'],help="Mode for the video generation")
-    parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to load/use")
-    parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of denoising steps")
-    parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT, help="Text prompt for generation")
-    parser.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT, help="Negative prompt for generation")
-    parser.add_argument("--guidance_steps", type=int, default=10, help="How many early steps run AMF guidance (set 0 for low-VRAM smoke test)")
-    parser.add_argument("--msa_enabled", action="store_true", help="Enable Video-MSA early structure guidance")
-    parser.add_argument("--msa_optim_start", type=int, default=0, help="First guidance step index where MSA is enabled")
-    parser.add_argument("--msa_optim_end", type=int, default=1, help="Last guidance step index where MSA is enabled")
-    parser.add_argument("--msa_iter", type=int, default=2, help="Number of latent optimization iterations per MSA-enabled guidance step")
-    parser.add_argument("--msa_scale_list", type=float, nargs="+", default=[50.0, 300.0], help="Per-step MSA scales for [msa_optim_start, msa_optim_end]")
-    parser.add_argument("--msa_mask_mode", type=str, default="uniform", choices=["uniform", "amf"], help="MSA spatial mask mode")
-    parser.add_argument("--msa_mask_power", type=float, default=1.0, help="Power applied to AMF-derived MSA mask")
-    parser.add_argument("--msa_mask_min", type=float, default=0.15, help="Minimum mask weight for MSA to avoid vanishing gradients")
-    parser.add_argument("--msa_balance_with_amf", action=argparse.BooleanOptionalAction, default=True, help="Dynamically balance MSA loss scale with AMF loss magnitude")
-    parser.add_argument("--msa_debug", action="store_true", help="Print MSA debug logs")
-    parser.add_argument("--ttc_enabled", action="store_true", help="Enable path-wise test-time correction")
-    parser.add_argument("--ttc_noise_levels", type=int, nargs="+", default=[500, 250], help="TTC target noise levels")
-    parser.add_argument("--ttc_step_ratios", type=float, nargs="+", default=[0.5, 0.25], help="TTC fallback ratios if noise-level mapping fails")
-    parser.add_argument("--ttc_anchor_blend", type=float, default=1.0, help="Legacy fixed blend fallback when TTC blend schedule is not set")
-    parser.add_argument("--ttc_anchor_mode", type=str, default="hybrid", choices=["legacy_input_clean", "pred_x0", "hybrid"], help="Anchor source for TTC first-frame correction")
-    parser.add_argument("--ttc_anchor_ref_weight", type=float, default=0.25, help="Reference-frame weight used only when --ttc_anchor_mode=hybrid")
-    parser.add_argument("--ttc_anchor_blend_start", type=float, default=0.35, help="TTC anchor blend at the first TTC hit")
-    parser.add_argument("--ttc_anchor_blend_end", type=float, default=0.12, help="TTC anchor blend at the last TTC hit")
-    parser.add_argument("--ttc_debug", action="store_true", help="Print resolved TTC step indices")
-    parser.add_argument("--denoising_strength", type=float, default=0.75, help="Denoising strength (default: 1.0)")
+    parser.add_argument("--model_dir", type=str, default=DEFAULT_MODEL_DIR)
+    parser.add_argument("--output_dir", type=str, default="results")
+    parser.add_argument("--input_video", type=str, default="data/source.mp4")
+    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--width", type=int, default=832)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--sf", type=int, default=4)
+    parser.add_argument("--test_latency", action="store_true")
+    parser.add_argument("--latency_dir", type=str, default=None)
+    parser.add_argument(
+        "--transfer_method",
+        type=str,
+        default=None,
+        choices=["fastvmt", "ditflow", "moft", "smm", "motionclone", "no_transfer"],
+        help="Unified transfer method interface for Wan-native benchmark baselines",
+    )
+    parser.add_argument(
+        "--benchmark_preset",
+        type=str,
+        default=None,
+        choices=["wan14b_32f_832x480", "wan13b_32f_832x480"],
+        help="Optional benchmark preset that overrides frames, resolution, and denoising steps",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="effi_AMF",
+        choices=["No_transfer", "effi_AMF", "AMF", "MOFT"],
+        help="Legacy compatibility mode. Prefer --transfer_method for new benchmark runs.",
+    )
+    parser.add_argument("--num_frames", type=int, default=81)
+    parser.add_argument("--num_inference_steps", type=int, default=50)
+    parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT)
+    parser.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT)
+    parser.add_argument("--guidance_steps", type=int, default=10)
+    parser.add_argument("--msa_enabled", action="store_true")
+    parser.add_argument("--msa_optim_start", type=int, default=0)
+    parser.add_argument("--msa_optim_end", type=int, default=1)
+    parser.add_argument("--msa_iter", type=int, default=2)
+    parser.add_argument("--msa_scale_list", type=float, nargs="+", default=[50.0, 300.0])
+    parser.add_argument("--msa_mask_mode", type=str, default="uniform", choices=["uniform", "amf"])
+    parser.add_argument("--msa_mask_power", type=float, default=1.0)
+    parser.add_argument("--msa_mask_min", type=float, default=0.15)
+    parser.add_argument("--msa_balance_with_amf", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--msa_debug", action="store_true")
+    parser.add_argument("--ttc_enabled", action="store_true")
+    parser.add_argument("--ttc_noise_levels", type=int, nargs="+", default=[500, 250])
+    parser.add_argument("--ttc_step_ratios", type=float, nargs="+", default=[0.5, 0.25])
+    parser.add_argument("--ttc_anchor_blend", type=float, default=1.0)
+    parser.add_argument(
+        "--ttc_anchor_mode",
+        type=str,
+        default="hybrid",
+        choices=["legacy_input_clean", "pred_x0", "hybrid"],
+    )
+    parser.add_argument("--ttc_anchor_ref_weight", type=float, default=0.25)
+    parser.add_argument("--ttc_anchor_blend_start", type=float, default=0.35)
+    parser.add_argument("--ttc_anchor_blend_end", type=float, default=0.12)
+    parser.add_argument("--ttc_debug", action="store_true")
+    parser.add_argument("--denoising_strength", type=float, default=0.75)
     args = parser.parse_args()
-    
-    # Set output directory
-    output_dir = args.output_dir
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+
+    os.makedirs(args.output_dir, exist_ok=True)
     main(args)
-
-
-
-
-
-

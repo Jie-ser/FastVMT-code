@@ -1,4 +1,5 @@
 from .data import *
+from .benchmarks import *
 from .models import *
 from .prompters import *
 from .schedulers import *

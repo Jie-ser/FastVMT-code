@@ -157,13 +157,30 @@ class SelfAttention(nn.Module):
             # Return all needed values
             return attn_out, q, k
         def reshape_qk(Q, K, size_info):
-            Q = Q.mean(dim=2)
-            K = K.mean(dim=2)
-            Q = Q.squeeze(0)
-            K = K.squeeze(0)
-            Q_reshaped = Q.view(size_info['frames'], size_info['tile_size'][0], size_info['tile_size'][1], -1)
-            K_reshaped = K.view(size_info['frames'], size_info['tile_size'][0], size_info['tile_size'][1], -1)
-            return Q_reshaped, K_reshaped
+            frames = int(size_info["frames"])
+            grid_h, grid_w = int(size_info["tile_size"][0]), int(size_info["tile_size"][1])
+            Q = rearrange(
+                Q,
+                "b (f h w) (n d) -> b f h w n d",
+                f=frames,
+                h=grid_h,
+                w=grid_w,
+                n=self.num_heads,
+                d=self.head_dim,
+            ).mean(dim=4)
+            K = rearrange(
+                K,
+                "b (f h w) (n d) -> b f h w n d",
+                f=frames,
+                h=grid_h,
+                w=grid_w,
+                n=self.num_heads,
+                d=self.head_dim,
+            ).mean(dim=4)
+            if Q.shape[0] == 1:
+                Q = Q[0]
+                K = K[0]
+            return Q.contiguous(), K.contiguous()
         # Use gradient checkpointing
         if self.training:
             x_out, q, k = torch.utils.checkpoint.checkpoint(
@@ -175,7 +192,7 @@ class SelfAttention(nn.Module):
             x_out, q, k = custom_forward(x, freqs, size_info)
 
         if self.save_qk:
-            self.q_reshape, self.k_reshape = reshape_qk(q.view(1, -1, self.num_heads, self.dim), k.view(1, -1, self.num_heads, self.dim), size_info)
+            self.q_reshape, self.k_reshape = reshape_qk(q, k, size_info)
         return self.o(x_out)
     
 
@@ -379,7 +396,7 @@ class WanModel(torch.nn.Module):
                 preserve_space: bool = False,
                 **kwargs,
                 ):
-        return_intermediates = kwargs.get('return_intermediates', False)
+        return_intermediates = kwargs.pop("return_intermediates", False)
     
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep))
@@ -405,8 +422,7 @@ class WanModel(torch.nn.Module):
                 return module(*inputs)
             return custom_forward
 
-        if return_intermediates:
-            intermediates = []
+        intermediates = [] if return_intermediates else None
         
         for i, block in enumerate(self.blocks):
             if preserve_space and i == 20:

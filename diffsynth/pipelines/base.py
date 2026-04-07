@@ -33,6 +33,8 @@ class BasePipeline(torch.nn.Module):
     
 
     def preprocess_images(self, images):
+        if hasattr(images, "__len__") and hasattr(images, "__getitem__"):
+            return [self.preprocess_image(images[idx]) for idx in range(len(images))]
         return [self.preprocess_image(image) for image in images]
     
 

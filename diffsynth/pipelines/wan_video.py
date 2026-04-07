@@ -19,6 +19,7 @@ from typing import Optional
 import gc
 import json
 
+from ..benchmarks import apply_benchmark_settings, normalize_transfer_method
 from ..vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear
 from ..models.wan_video_text_encoder import T5RelativeEmbedding, T5LayerNorm
 from ..models.wan_video_dit import RMSNorm, sinusoidal_embedding_1d
@@ -258,6 +259,35 @@ class WanVideoPipeline(BasePipeline):
         frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
         frames = [Image.fromarray(frame) for frame in frames]
         return frames
+
+
+    def align_output_frame_count(self, frames, target_frames):
+        target_frames = int(target_frames)
+        current_frames = int(frames.shape[2])
+        if target_frames <= 0:
+            raise ValueError("target_frames must be positive.")
+        if current_frames <= 0:
+            raise ValueError("Cannot align an empty frame sequence.")
+        if current_frames == target_frames:
+            return frames
+        if target_frames == 1:
+            return frames[:, :, :1].clone()
+
+        positions = torch.linspace(
+            0,
+            current_frames - 1,
+            steps=target_frames,
+            device=frames.device,
+            dtype=torch.float32,
+        )
+        left_idx = torch.floor(positions).long()
+        right_idx = torch.ceil(positions).long()
+        weights = (positions - left_idx.to(dtype=positions.dtype)).view(1, 1, target_frames, 1, 1)
+
+        left_frames = frames.index_select(2, left_idx)
+        right_frames = frames.index_select(2, right_idx)
+        weights = weights.to(dtype=frames.dtype)
+        return left_frames * (1.0 - weights) + right_frames * weights
     
     
     def prepare_extra_input(self, latents=None):
@@ -495,25 +525,151 @@ class WanVideoPipeline(BasePipeline):
         loss = (squared_l2_norm * self.weights).mean()
         
         return loss
+
+    @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    def compute_dense_AMF(self, Q, K, sf, tau=1.0):
+        """
+        Compute dense AMF without the sliding-window approximation.
+        This is used for the Wan-native DiTFlow adaptation.
+        """
+        f, h, w, d = K.shape
+        s = h * w
+        q_flat = Q.view(f, s, d)
+        k_flat = K.view(f, s, d)
+        u = (torch.arange(s, device=Q.device) // w).float()
+        v = (torch.arange(s, device=Q.device) % w).float()
+        motion = []
+        for i in range(f):
+            for j in range(i, min(f, i + sf)):
+                scores = torch.matmul(q_flat[i], k_flat[j].transpose(-1, -2)) / (d ** 0.5)
+                scores = F.softmax(scores * tau, dim=-1)
+                u_j = torch.sum(scores * u.view(1, -1), dim=-1)
+                v_j = torch.sum(scores * v.view(1, -1), dim=-1)
+                motion.append(torch.stack([u_j - u, v_j - v], dim=-1))
+        return torch.stack(motion)
+
+    @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    def compute_sparse_AMF(self, Q, K, sf, topk=8, tau=1.0):
+        """
+        Compute a sparse temporal attention motion descriptor for the
+        Wan-native MotionClone adaptation.
+        """
+        f, h, w, d = K.shape
+        s = h * w
+        q_flat = Q.view(f, s, d)
+        k_flat = K.view(f, s, d)
+        u = (torch.arange(s, device=Q.device) // w).float()
+        v = (torch.arange(s, device=Q.device) % w).float()
+        topk = int(max(1, min(topk, s)))
+        motion = []
+        for i in range(f):
+            for j in range(i, min(f, i + sf)):
+                scores = torch.matmul(q_flat[i], k_flat[j].transpose(-1, -2)) / (d ** 0.5)
+                topk_values, topk_indices = torch.topk(scores, k=topk, dim=-1)
+                sparse_scores = F.softmax(topk_values * tau, dim=-1)
+                u_sparse = u[topk_indices]
+                v_sparse = v[topk_indices]
+                u_j = torch.sum(sparse_scores * u_sparse, dim=-1)
+                v_j = torch.sum(sparse_scores * v_sparse, dim=-1)
+                motion.append(torch.stack([u_j - u, v_j - v], dim=-1))
+        return torch.stack(motion)
+
+    def _set_attention_capture(self, block_id: int, enabled: bool = True):
+        target = int(block_id)
+        for idx, block in enumerate(self.dit.blocks):
+            block.self_attn.save_qk = bool(enabled and idx == target)
+
+    def _reshape_sequence_tokens(self, tokens: torch.Tensor, size_info: dict):
+        if tokens is None:
+            return None
+        frames = int(size_info["frames"])
+        grid_h = int(size_info["tile_size"][0])
+        grid_w = int(size_info["tile_size"][1])
+        hidden = rearrange(tokens, "b (f h w) c -> b f h w c", f=frames, h=grid_h, w=grid_w)
+        return hidden.contiguous()
+
+    def _extract_guidance_state(
+        self,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        prompt_kwargs,
+        image_emb,
+        extra_input,
+        size_info,
+        block_id: int = 14,
+    ):
+        self._set_attention_capture(block_id, True)
+        velocity, intermediates = self.dit(
+            latents,
+            timestep=timestep,
+            preserve_space=True,
+            size_info=size_info,
+            return_intermediates=True,
+            **prompt_kwargs,
+            **image_emb,
+            **extra_input,
+        )
+        capture_idx = min(int(block_id), len(intermediates) - 1)
+        hidden = self._reshape_sequence_tokens(intermediates[capture_idx], size_info)
+        attn = self.dit.blocks[capture_idx].self_attn
+        state = {
+            "velocity": velocity,
+            "hidden": hidden,
+            "q": attn.q_reshape,
+            "k": attn.k_reshape,
+        }
+        self._set_attention_capture(block_id, False)
+        return state
+
+    def _compute_smm_feature(self, hidden: torch.Tensor, pool_size: int = 4):
+        if hidden is None:
+            raise ValueError("SMM guidance requires hidden features, but none were captured.")
+        if hidden.shape[0] != 1:
+            raise ValueError("SMM guidance currently expects batch size 1.")
+        feature = rearrange(hidden[0], "f h w c -> f c h w").float()
+        feature = F.adaptive_avg_pool2d(feature, output_size=(pool_size, pool_size))
+        feature = feature - feature.mean(dim=(2, 3), keepdim=True)
+        feature = feature[1:] - feature[:-1]
+        flat = feature.flatten(1)
+        feature = feature / flat.norm(dim=1, keepdim=True).clamp_min(1e-6).view(-1, 1, 1, 1)
+        return feature.to(dtype=self.torch_dtype, device=self.device)
+
+    def _compute_moft_feature(self, hidden: torch.Tensor, topk_idx=None, channel_ratio: float = 0.125):
+        if hidden is None:
+            raise ValueError("MOFT guidance requires hidden features, but none were captured.")
+        if hidden.shape[0] != 1:
+            raise ValueError("MOFT guidance currently expects batch size 1.")
+        feature = rearrange(hidden[0], "f h w c -> f c h w").float().mean(dim=(-1, -2))
+        feature = feature - feature.mean(dim=0, keepdim=True)
+        feature = feature[1:] - feature[:-1]
+        if topk_idx is None:
+            scores = feature.abs().mean(dim=0)
+            num_channels = scores.shape[0]
+            keep = max(1, int(num_channels * float(channel_ratio)))
+            topk_idx = torch.topk(scores, k=min(keep, num_channels), dim=0).indices
+        feature = feature.index_select(1, topk_idx)
+        feature = feature / feature.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        return feature.to(dtype=self.torch_dtype, device=self.device), topk_idx
     
     
     def compute_indices(self, h, w, tile_h, tile_w, l, half_l, num_tiles_h, num_tiles_w, D_h):
-        u = torch.arange(h*w, device='cuda').unsqueeze(0) // w
-        v = torch.arange(h*w, device='cuda').unsqueeze(0) % w
+        device = self.device
+        u = torch.arange(h*w, device=device).unsqueeze(0) // w
+        v = torch.arange(h*w, device=device).unsqueeze(0) % w
         
-        posi_u_in_window = (torch.arange(l**2, device='cuda') // l).unsqueeze(0)
-        posi_v_in_window = (torch.arange(l**2, device='cuda') % l).unsqueeze(0)
+        posi_u_in_window = (torch.arange(l**2, device=device) // l).unsqueeze(0)
+        posi_v_in_window = (torch.arange(l**2, device=device) % l).unsqueeze(0)
         
         #rows = torch.arange(0, h, tile_h, device='cuda').long()
         #cols = torch.arange(0, w, tile_w, device='cuda').long()
-        rows = torch.arange(tile_h // 2, h + tile_h // 2, tile_h, device='cuda').long()
-        cols = torch.arange(tile_w // 2, w + tile_w // 2, tile_w, device='cuda').long()
+        rows = torch.arange(tile_h // 2, h + tile_h // 2, tile_h, device=device).long()
+        cols = torch.arange(tile_w // 2, w + tile_w // 2, tile_w, device=device).long()
         
-        h_offsets = torch.arange(-half_l, half_l + 1, device='cuda').view(1, 1, l, 1).expand(-1,-1,l,l)
-        w_offsets = torch.arange(-half_l, half_l + 1, device='cuda').view(1, 1, 1, l).expand(-1,-1,l,l)
+        h_offsets = torch.arange(-half_l, half_l + 1, device=device).view(1, 1, l, 1).expand(-1,-1,l,l)
+        w_offsets = torch.arange(-half_l, half_l + 1, device=device).view(1, 1, 1, l).expand(-1,-1,l,l)
         
-        orig_u = torch.arange(tile_h * tile_w, device='cuda').repeat(num_tiles_h * num_tiles_w) // tile_w
-        orig_v = torch.arange(tile_h * tile_w, device='cuda').repeat(num_tiles_h * num_tiles_w) % tile_w
+        orig_u = torch.arange(tile_h * tile_w, device=device).repeat(num_tiles_h * num_tiles_w) // tile_w
+        orig_v = torch.arange(tile_h * tile_w, device=device).repeat(num_tiles_h * num_tiles_w) % tile_w
         #num_cals = f * sf - (1 + sf) * sf // 2
         grid_row, grid_col = torch.meshgrid(rows, cols, indexing='ij')
         grid_row = grid_row.flatten() # (num_tiles_h * num_tiles_w,)
@@ -526,7 +682,7 @@ class WanVideoPipeline(BasePipeline):
         #self.posi_u_in_window = posi_u_in_window
         #self.posi_v_in_window = posi_v_in_window
         # Sparsed
-        mask = (torch.arange(l**2, device='cuda').unsqueeze(0) % 2 == 0).float()
+        mask = (torch.arange(l**2, device=device).unsqueeze(0) % 2 == 0).float()
         self.posi_u_in_window = posi_u_in_window * mask
         self.posi_v_in_window = posi_v_in_window * mask
         self.orig_u = orig_u
@@ -704,61 +860,57 @@ class WanVideoPipeline(BasePipeline):
             # Fallback keeps optimization stable when AMF mask inference fails.
             return torch.ones((b, 1, 1, h, w), dtype=self.torch_dtype, device=self.device)
         
-    def guidance_step(self, 
-                      latents: torch.Tensor, 
-                      timestep: torch.Tensor,
-                      prompt_emb_posi,
-                      prompt_null,
-                      image_emb,
-                      extra_input,
-                      noise, 
-                      size_info, 
-                      sf, # sf is the farthest frame distance to consider
-                      mode, 
-                      seed,
-                      step_id,
-                      interval: int=3,
-                      msa_enabled: bool=False,
-                      msa_optim_start: int=0,
-                      msa_optim_end: int=1,
-                      msa_iter: int=2,
-                      msa_scale_list=(50.0, 300.0),
-                      msa_mask_mode: str="uniform",
-                      msa_mask_power: float=1.0,
-                      msa_mask_min: float=0.15,
-                      msa_balance_with_amf: bool=True,
-                      msa_debug: bool=False,
-                      ) -> torch.Tensor:
-        # Do the guidance step to optimize the latent representation.
-        
-        # Initialize the learning rate
+    def guidance_step(
+        self,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        prompt_emb_posi,
+        prompt_null,
+        image_emb,
+        extra_input,
+        noise,
+        size_info,
+        sf,
+        transfer_method,
+        seed,
+        step_id,
+        interval: int = 3,
+        guidance_block_id: int = 14,
+        motionclone_topk: int = 8,
+        smm_pool_size: int = 4,
+        moft_channel_ratio: float = 0.125,
+        msa_enabled: bool = False,
+        msa_optim_start: int = 0,
+        msa_optim_end: int = 1,
+        msa_iter: int = 2,
+        msa_scale_list=(50.0, 300.0),
+        msa_mask_mode: str = "uniform",
+        msa_mask_power: float = 1.0,
+        msa_mask_min: float = 0.15,
+        msa_balance_with_amf: bool = True,
+        msa_debug: bool = False,
+    ) -> torch.Tensor:
         self.clean_memory()
-        initial_lr = 0.003  
+        initial_lr = 0.003
         final_lr = 0.002
         default_total_steps = 10
+        transfer_method = normalize_transfer_method(transfer_method=transfer_method)
+        fastvmt_active = transfer_method == "fastvmt"
         msa_step_active = (
-            bool(msa_enabled)
+            fastvmt_active
+            and bool(msa_enabled)
             and hasattr(self, "clean_latents")
             and self.clean_latents is not None
             and int(msa_optim_start) <= int(step_id) <= int(msa_optim_end)
         )
         total_steps = int(max(1, msa_iter if msa_step_active else default_total_steps))
-        effective_interval = 1 if msa_step_active else max(1, int(interval))
-        current_step = 0    # current optimization step
-        
-        for i, block in enumerate(self.dit.blocks):  
-            
-            if i == 14:  
-                self_attn = block.self_attn  
-                self_attn.save_qk = True  # save the q_k and k_k for AMF computation
-                break 
-        
+        effective_interval = 1 if not fastvmt_active or msa_step_active else max(1, int(interval))
+        current_step = 0
+
         optimized_latents = latents.clone().detach().requires_grad_(True)
-        # optimized_x: copy the current latent representation and enable gradient computation
         optimizer = torch.optim.AdamW([optimized_latents], lr=initial_lr)
-        # initialize the optimizer with the optimized_latents
-        
-        self.scale_range = np.linspace(0.007 , 0.004, 50)#[0.007 , 0.004],50,self.scale_range = np.linspace(config["scale_range"][0], config["scale_range"][1], len(self.guidance_schedule))
+        self.scale_range = np.linspace(0.007, 0.004, 50)
+        self.cached_grad = None
 
         msa_anchor_velocity = None
         msa_mask = None
@@ -771,29 +923,42 @@ class WanVideoPipeline(BasePipeline):
                     print(f"MSA disabled at step={step_id}: scale list index {local_msa_step_id} is out of range.")
             else:
                 msa_scale = float(msa_scale_list[local_msa_step_id])
-        
-        with torch.no_grad(): # disable the gradient computation to calculate reference of the ref video
+
+        with torch.no_grad():
             noise = self.generate_noise(latents.shape, device=latents.device, dtype=torch.float32, seed=seed)
             noise = noise.to(dtype=self.torch_dtype, device=self.device)
             ref_latents = self.scheduler.add_noise(self.clean_latents, noise, timestep=timestep)
-            ref_velocity = self.dit(ref_latents, timestep=timestep, preserve_space=True, size_info=size_info, **prompt_null, **image_emb, **extra_input)
-            num_blocks = len(self.dit.blocks)
-            print(f"Total number of blocks: {num_blocks}")
-            for i, block in enumerate(self.dit.blocks):  # retrieve the index using enumerate
-                if i == 14:  # The 15th block (index starts from 0)
-                    self_attn = block.self_attn  # retrieve the WanSelfAttention instance
-                    k_k = self_attn.k_reshape  # retrieve self.k_k
-                    q_q = self_attn.q_reshape  # retrieve self.q_q
-                    break  # quitting the loop after finding the 15th block
-            if mode == 'effi_AMF':
-                amf, _ = self.compute_tile_AMF(q_q, k_k, sf=sf, l=21, tau=1.0, tile=(3, 4))
+            ref_state = self._extract_guidance_state(
+                ref_latents,
+                timestep=timestep,
+                prompt_kwargs=prompt_null,
+                image_emb=image_emb,
+                extra_input=extra_input,
+                size_info=size_info,
+                block_id=guidance_block_id,
+            )
+
+            ref_signal = None
+            ref_aux = {}
+            if transfer_method == "fastvmt":
+                ref_signal, _ = self.compute_tile_AMF(ref_state["q"], ref_state["k"], sf=sf, l=21, tau=1.0, tile=(3, 4))
+            elif transfer_method == "ditflow":
+                ref_signal = self.compute_dense_AMF(ref_state["q"], ref_state["k"], sf=sf, tau=1.0)
+            elif transfer_method == "motionclone":
+                ref_signal = self.compute_sparse_AMF(ref_state["q"], ref_state["k"], sf=sf, topk=motionclone_topk, tau=1.0)
+            elif transfer_method == "smm":
+                ref_signal = self._compute_smm_feature(ref_state["hidden"], pool_size=smm_pool_size)
+            elif transfer_method == "moft":
+                ref_signal, ref_aux["topk_idx"] = self._compute_moft_feature(
+                    ref_state["hidden"], topk_idx=None, channel_ratio=moft_channel_ratio
+                )
             else:
-                raise ValueError('Please set a valid mode to generate videos')
+                raise ValueError(f"Unsupported transfer_method `{transfer_method}` during guidance.")
 
             if msa_step_active:
-                msa_anchor_velocity = ref_velocity.detach()
+                msa_anchor_velocity = ref_state["velocity"].detach()
                 msa_mask = self._build_msa_mask(
-                    amf,
+                    ref_signal if transfer_method == "fastvmt" else None,
                     target_shape=latents.shape,
                     size_info=size_info,
                     msa_mask_mode=msa_mask_mode,
@@ -806,40 +971,44 @@ class WanVideoPipeline(BasePipeline):
                         f"mask_mode={msa_mask_mode}, mask_min={float(msa_mask.min().item()):.4f}, "
                         f"mask_max={float(msa_mask.max().item()):.4f}"
                     )
-            
-        # Compute AMF of the generated latent
-        
+
         self.clean_memory()
-        detached_prompt_emb_posi_new = {k: v.detach() if hasattr(v, 'detach') else v for k, v in prompt_emb_posi.items()}
+        detached_prompt_emb_posi_new = {k: v.detach() if hasattr(v, "detach") else v for k, v in prompt_emb_posi.items()}
         for j in tqdm(range(total_steps)):
             lr = initial_lr - (initial_lr - final_lr) * (current_step / total_steps)
             for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
+                param_group["lr"] = lr
             optimizer.zero_grad(set_to_none=True)
             with torch.enable_grad():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    
                     self.dit.train()
                     for param in self.dit.parameters():
                         param.requires_grad_(False)
-                    if j % effective_interval == 0 or mode == 'AMF':
-                        pred_velocity = self.dit(optimized_latents, timestep=timestep, size_info=size_info, preserve_space=True, **detached_prompt_emb_posi_new, **image_emb, **extra_input)
 
-                        for i, block in enumerate(self.dit.blocks):  
-            
-                            if i == 14:  
-                                self_attn = block.self_attn  
-                                k_k_new = self_attn.k_reshape  
-                                q_q_new = self_attn.q_reshape 
-                                break 
-                        if mode == 'effi_AMF':
-                            amf_new, track_loss = self.compute_tile_AMF(q_q_new,k_k_new,sf=sf, l=21, tau=1.0, tile=(3, 4))
-                            amf_loss = self.compute_tile_amf_loss(amf, amf_new)
-                            loss_core = 5 * amf_loss + track_loss
+                    should_recompute = (self.cached_grad is None) or (j % effective_interval == 0)
+                    if should_recompute:
+                        gen_state = self._extract_guidance_state(
+                            optimized_latents,
+                            timestep=timestep,
+                            prompt_kwargs=detached_prompt_emb_posi_new,
+                            image_emb=image_emb,
+                            extra_input=extra_input,
+                            size_info=size_info,
+                            block_id=guidance_block_id,
+                        )
+
+                        if transfer_method == "fastvmt":
+                            gen_signal, track_loss = self.compute_tile_AMF(
+                                gen_state["q"], gen_state["k"], sf=sf, l=21, tau=1.0, tile=(3, 4)
+                            )
+                            motion_loss = self.compute_tile_amf_loss(ref_signal, gen_signal)
+                            loss_core = 5 * motion_loss + track_loss
                             if msa_step_active and msa_anchor_velocity is not None and msa_scale is not None:
-                                msa_loss = self._compute_msa_velocity_loss(pred_velocity, msa_anchor_velocity, msa_mask)
+                                msa_loss = self._compute_msa_velocity_loss(gen_state["velocity"], msa_anchor_velocity, msa_mask)
                                 if msa_balance_with_amf:
-                                    balance = (loss_core.detach().abs() / msa_loss.detach().abs().clamp_min(1e-6)).clamp(min=0.05, max=20.0)
+                                    balance = (
+                                        loss_core.detach().abs() / msa_loss.detach().abs().clamp_min(1e-6)
+                                    ).clamp(min=0.05, max=20.0)
                                     msa_weight = float(msa_scale) * balance
                                 else:
                                     msa_weight = float(msa_scale)
@@ -847,22 +1016,41 @@ class WanVideoPipeline(BasePipeline):
                                 if msa_debug and (j == 0 or j == total_steps - 1):
                                     print(
                                         f"MSA debug step={step_id}, iter={j + 1}/{total_steps}: "
-                                        f"amf={float(amf_loss.detach().item()):.6f}, "
+                                        f"amf={float(motion_loss.detach().item()):.6f}, "
                                         f"track={float(track_loss.detach().item()):.6f}, "
                                         f"msa={float(msa_loss.detach().item()):.6f}"
                                     )
                             else:
                                 loss = loss_core
+                        elif transfer_method == "ditflow":
+                            gen_signal = self.compute_dense_AMF(gen_state["q"], gen_state["k"], sf=sf, tau=1.0)
+                            loss = 5 * self.compute_tile_amf_loss(ref_signal, gen_signal)
+                        elif transfer_method == "motionclone":
+                            gen_signal = self.compute_sparse_AMF(
+                                gen_state["q"], gen_state["k"], sf=sf, topk=motionclone_topk, tau=1.0
+                            )
+                            loss = 5 * self.compute_tile_amf_loss(ref_signal, gen_signal)
+                        elif transfer_method == "smm":
+                            gen_signal = self._compute_smm_feature(gen_state["hidden"], pool_size=smm_pool_size)
+                            loss = F.mse_loss(gen_signal.float(), ref_signal.detach().float())
+                        elif transfer_method == "moft":
+                            gen_signal, _ = self._compute_moft_feature(
+                                gen_state["hidden"],
+                                topk_idx=ref_aux["topk_idx"],
+                                channel_ratio=moft_channel_ratio,
+                            )
+                            loss = F.mse_loss(gen_signal.float(), ref_signal.detach().float())
+                        else:
+                            raise ValueError(f"Unsupported transfer_method `{transfer_method}` during optimization.")
                     else:
                         loss = (optimized_latents * self.cached_grad).sum()
 
-                    loss.backward()       
-                    self.cached_grad = optimized_latents.grad.clone().detach()  
+                    loss.backward()
+                    self.cached_grad = optimized_latents.grad.clone().detach()
                     optimizer.step()
-
                     self.clean_memory()
-            current_step = current_step + 1
-            print("lr",lr)
+            current_step += 1
+            print("lr", lr)
         return optimized_latents
     
     
@@ -899,7 +1087,14 @@ class WanVideoPipeline(BasePipeline):
         sf=4,
         test_latency=False,
         latency_dir=None,
+        transfer_method=None,
+        benchmark_preset=None,
+        benchmark_strict=True,
         mode=None,
+        guidance_block_id=14,
+        motionclone_topk=8,
+        smm_pool_size=4,
+        moft_channel_ratio=0.125,
         ttc_enabled=False,
         ttc_noise_levels=(500, 250),
         ttc_step_ratios=(0.5, 0.25),
@@ -923,19 +1118,38 @@ class WanVideoPipeline(BasePipeline):
     ):
         self.indices_computed = False
         self.indices_expanded = []
-        if mode is None:
-            print('You did not specify the mode of transfer, we use efficient AMF mode by default.')
-            mode = 'effi_AMF'
-        elif mode == 'AMF':
-            print('You are using the AMF mode, which is more accurate but slower.')
-        elif mode == 'effi_AMF':
-            print('You are using the efficient AMF mode, which is faster but less accurate.')
-        elif mode == 'No_transfer':
-            print('You are using the No_transfer mode, which does not use any transfer method.')
-        elif mode == 'MOFT':
-            print('You are using the MOFT mode, which uses the MOtion FeaTure to transfer the motion.')
+        self.last_run_summary = None
+        transfer_method = normalize_transfer_method(transfer_method=transfer_method, mode=mode)
+        if transfer_method == "fastvmt":
+            print("You are using the FastVMT transfer method with Wan-native sliding-window AMF guidance.")
+        elif transfer_method == "ditflow":
+            print("You are using the DiTFlow transfer method with Wan-native dense AMF guidance.")
+        elif transfer_method == "smm":
+            print("You are using the SMM transfer method with Wan-native space-time feature guidance.")
+        elif transfer_method == "moft":
+            print("You are using the MOFT transfer method with Wan-native motion-channel guidance.")
+        elif transfer_method == "motionclone":
+            print("You are using the MotionClone transfer method with Wan-native sparse temporal attention guidance.")
+        elif transfer_method == "no_transfer":
+            print("You are using the no_transfer method, which does not apply motion transfer guidance.")
         else:
-            raise ValueError('Please set a valid mode to generate videos')
+            raise ValueError(f"Unsupported transfer_method `{transfer_method}`.")
+
+        benchmark_settings = apply_benchmark_settings(
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            num_inference_steps=num_inference_steps,
+            benchmark_preset=benchmark_preset,
+        )
+        height = int(benchmark_settings["height"])
+        width = int(benchmark_settings["width"])
+        num_frames = int(benchmark_settings["num_frames"])
+        num_inference_steps = int(benchmark_settings["num_inference_steps"])
+        benchmark_preset = benchmark_settings.get("benchmark_preset", benchmark_preset)
+
+        if transfer_method != "no_transfer" and input_video is None:
+            raise ValueError(f"transfer_method `{transfer_method}` requires a reference `input_video`.")
 
         msa_mask_mode = str(msa_mask_mode).strip().lower()
         if msa_mask_mode not in ["uniform", "amf"]:
@@ -947,8 +1161,15 @@ class WanVideoPipeline(BasePipeline):
         msa_enabled = bool(msa_enabled)
         msa_scale_list = tuple(float(scale) for scale in msa_scale_list)
 
-        if msa_enabled and mode == 'No_transfer':
-            print("MSA is disabled because `mode='No_transfer'`.")
+        if transfer_method != "fastvmt" and ttc_enabled:
+            print(f"TTC is disabled because transfer_method='{transfer_method}' does not use FastVMT path correction.")
+            ttc_enabled = False
+        if transfer_method != "fastvmt" and msa_enabled:
+            print(f"MSA is disabled because transfer_method='{transfer_method}' does not use FastVMT structure anchoring.")
+            msa_enabled = False
+
+        if msa_enabled and transfer_method == "no_transfer":
+            print("MSA is disabled because `transfer_method='no_transfer'`.")
             msa_enabled = False
         if msa_enabled and guidance_steps <= 0:
             print("MSA is disabled because `guidance_steps <= 0`.")
@@ -984,11 +1205,24 @@ class WanVideoPipeline(BasePipeline):
 
         # Auto-infer num_frames from input_video if provided
         if input_video is not None:
+            if benchmark_preset is not None:
+                available_frames = len(input_video)
+                if available_frames < num_frames:
+                    raise ValueError(
+                        f"Reference input_video only has {available_frames} frames, but benchmark_preset "
+                        f"`{benchmark_preset}` requires {num_frames} frames."
+                    )
+                if benchmark_strict or available_frames != num_frames:
+                    input_video.set_length(num_frames)
             inferred_frames = len(input_video)
-            if num_frames != inferred_frames:
+            if benchmark_preset is None and num_frames != inferred_frames:
                 print(f"num_frames auto-adjusted from {num_frames} to {inferred_frames} based on input_video length.")
                 num_frames = inferred_frames
-            # Skip num_frames adjustment when input_video is provided (latent frames determined by video)
+            elif benchmark_preset is not None and inferred_frames != num_frames:
+                raise ValueError(
+                    f"Benchmark preset `{benchmark_preset}` requires {num_frames} frames after protocol enforcement, "
+                    f"but got {inferred_frames}."
+                )
         elif num_frames % 4 != 1:
             num_frames = (num_frames + 2) // 4 * 4 + 1
             print(f"Only `num_frames % 4 != 1` is acceptable. We round it up to {num_frames}.")
@@ -1008,7 +1242,7 @@ class WanVideoPipeline(BasePipeline):
                 weights = np.concatenate([weights, np.linspace(1, 0.8, num=sf)], axis=0)
             else:
                 weights = np.concatenate([weights, np.linspace(1, 0.8, num=sf)[:latent_frames-i]], axis=0)
-        self.weights = torch.tensor(weights, dtype=torch.float32, device='cuda')
+        self.weights = torch.tensor(weights, dtype=torch.float32, device=self.device)
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
 
@@ -1078,7 +1312,7 @@ class WanVideoPipeline(BasePipeline):
         ttc_blend_end = ttc_blend_start if ttc_anchor_blend_end is None else float(ttc_anchor_blend_end)
         ttc_blend_start = float(max(0.0, min(1.0, ttc_blend_start)))
         ttc_blend_end = float(max(0.0, min(1.0, ttc_blend_end)))
-        if ttc_enabled and mode != 'No_transfer':
+        if ttc_enabled and transfer_method == "fastvmt":
             # Resolve TTC trigger steps once before denoising loop.
             ttc_indices = set(self._resolve_ttc_indices(self.scheduler.timesteps, ttc_noise_levels, ttc_step_ratios))
             if ttc_debug:
@@ -1114,24 +1348,70 @@ class WanVideoPipeline(BasePipeline):
                 start_event_gen.record()
             for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
                 timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
-                if mode != 'No_transfer' and i_for_guidance < guidance_steps:
+                if transfer_method != "no_transfer" and i_for_guidance < guidance_steps:
                     if test_latency:
                         start_event_guidance[i_for_guidance].record()
                     
-                        latents = self.guidance_step(latents, timestep,prompt_emb_posi,prompt_null,image_emb,extra_input,noise,size_info, 
-                                                 sf=sf, mode=mode, seed=seed, interval=3, step_id=progress_id,
-                                                 msa_enabled=msa_enabled, msa_optim_start=msa_optim_start, msa_optim_end=msa_optim_end,
-                                                 msa_iter=msa_iter, msa_scale_list=msa_scale_list, msa_mask_mode=msa_mask_mode,
-                                                 msa_mask_power=msa_mask_power, msa_mask_min=msa_mask_min,
-                                                 msa_balance_with_amf=msa_balance_with_amf, msa_debug=msa_debug)
+                        latents = self.guidance_step(
+                            latents,
+                            timestep,
+                            prompt_emb_posi,
+                            prompt_null,
+                            image_emb,
+                            extra_input,
+                            noise,
+                            size_info,
+                            sf=sf,
+                            transfer_method=transfer_method,
+                            seed=seed,
+                            interval=3,
+                            step_id=progress_id,
+                            guidance_block_id=guidance_block_id,
+                            motionclone_topk=motionclone_topk,
+                            smm_pool_size=smm_pool_size,
+                            moft_channel_ratio=moft_channel_ratio,
+                            msa_enabled=msa_enabled,
+                            msa_optim_start=msa_optim_start,
+                            msa_optim_end=msa_optim_end,
+                            msa_iter=msa_iter,
+                            msa_scale_list=msa_scale_list,
+                            msa_mask_mode=msa_mask_mode,
+                            msa_mask_power=msa_mask_power,
+                            msa_mask_min=msa_mask_min,
+                            msa_balance_with_amf=msa_balance_with_amf,
+                            msa_debug=msa_debug,
+                        )
                         end_event_guidance[i_for_guidance].record()
                     else:
-                        latents = self.guidance_step(latents, timestep,prompt_emb_posi,prompt_null,image_emb,extra_input,noise,size_info,
-                                                 sf=sf, mode=mode, seed=seed, interval=3, step_id=progress_id,
-                                                 msa_enabled=msa_enabled, msa_optim_start=msa_optim_start, msa_optim_end=msa_optim_end,
-                                                 msa_iter=msa_iter, msa_scale_list=msa_scale_list, msa_mask_mode=msa_mask_mode,
-                                                 msa_mask_power=msa_mask_power, msa_mask_min=msa_mask_min,
-                                                 msa_balance_with_amf=msa_balance_with_amf, msa_debug=msa_debug)
+                        latents = self.guidance_step(
+                            latents,
+                            timestep,
+                            prompt_emb_posi,
+                            prompt_null,
+                            image_emb,
+                            extra_input,
+                            noise,
+                            size_info,
+                            sf=sf,
+                            transfer_method=transfer_method,
+                            seed=seed,
+                            interval=3,
+                            step_id=progress_id,
+                            guidance_block_id=guidance_block_id,
+                            motionclone_topk=motionclone_topk,
+                            smm_pool_size=smm_pool_size,
+                            moft_channel_ratio=moft_channel_ratio,
+                            msa_enabled=msa_enabled,
+                            msa_optim_start=msa_optim_start,
+                            msa_optim_end=msa_optim_end,
+                            msa_iter=msa_iter,
+                            msa_scale_list=msa_scale_list,
+                            msa_mask_mode=msa_mask_mode,
+                            msa_mask_power=msa_mask_power,
+                            msa_mask_min=msa_mask_min,
+                            msa_balance_with_amf=msa_balance_with_amf,
+                            msa_debug=msa_debug,
+                        )
                     i_for_guidance += 1
 
                 # Inference
@@ -1152,7 +1432,7 @@ class WanVideoPipeline(BasePipeline):
                 else:
                     noise_pred = noise_pred_posi
 
-                if ttc_enabled and mode != 'No_transfer' and progress_id in ttc_indices and progress_id + 1 < len(self.scheduler.timesteps):
+                if ttc_enabled and transfer_method == "fastvmt" and progress_id in ttc_indices and progress_id + 1 < len(self.scheduler.timesteps):
                     if ttc_total_hits <= 1:
                         current_ttc_blend = ttc_blend_start
                     else:
@@ -1217,8 +1497,33 @@ class WanVideoPipeline(BasePipeline):
         # Decode
         self.load_models_to_device(['vae'])
         frames = self.decode_video(latents, **tiler_kwargs)
+        decoded_num_frames = int(frames.shape[2])
+        output_num_frames = decoded_num_frames
+        if benchmark_preset is not None and decoded_num_frames != num_frames:
+            print(
+                f"Benchmark preset `{benchmark_preset}` requires {num_frames} output frames, "
+                f"but Wan VAE decoded {decoded_num_frames}. Applying temporal resampling to enforce protocol."
+            )
+            frames = self.align_output_frame_count(frames, target_frames=num_frames)
+            output_num_frames = int(frames.shape[2])
+            if output_num_frames != num_frames:
+                raise ValueError(
+                    f"Failed to align decoded frames for benchmark preset `{benchmark_preset}`: "
+                    f"expected {num_frames}, got {output_num_frames}."
+                )
         self.load_models_to_device([])
         frames = self.tensor2video(frames[0])
+        self.last_run_summary = {
+            "transfer_method": transfer_method,
+            "benchmark_preset": benchmark_preset,
+            "height": height,
+            "width": width,
+            "requested_num_frames": num_frames,
+            "decoded_num_frames": decoded_num_frames,
+            "output_num_frames": output_num_frames,
+            "num_frames": output_num_frames,
+            "num_inference_steps": num_inference_steps,
+        }
 
         return frames
 
@@ -1334,17 +1639,15 @@ def model_fn_wan_video(
             x = torch.chunk(x, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
     if tea_cache_update:
         x = tea_cache.update(x)
-    if return_intermediates:
-        intermediates = []
-    else:
-        for block_id, block in enumerate(dit.blocks):
-            x = block(x, context, t_mod, freqs, size_info)
-            if vace_context is not None and block_id in vace.vace_layers_mapping:
-                x = x + vace_hints[vace.vace_layers_mapping[block_id]] * vace_scale
-            if return_intermediates:
-                intermediates.append(x)
-        if tea_cache is not None:
-            tea_cache.store(x)
+    intermediates = [] if return_intermediates else None
+    for block_id, block in enumerate(dit.blocks):
+        x = block(x, context, t_mod, freqs, size_info)
+        if vace_context is not None and block_id in vace.vace_layers_mapping:
+            x = x + vace_hints[vace.vace_layers_mapping[block_id]] * vace_scale
+        if return_intermediates:
+            intermediates.append(x)
+    if tea_cache is not None:
+        tea_cache.store(x)
 
     x = dit.head(x, t)
     if use_unified_sequence_parallel:
