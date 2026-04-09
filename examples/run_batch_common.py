@@ -18,12 +18,17 @@ from diffsynth import (
     ModelManager,
     VideoData,
     WanVideoPipeline,
+    save_video,
+)
+from diffsynth.benchmarks import (
     apply_benchmark_settings,
     build_run_metadata,
+    get_method_family,
+    is_tuning_based_method,
     normalize_transfer_method,
-    save_video,
     write_metadata,
 )
+from diffsynth.tuning import run_tuning_case
 
 
 DEFAULT_RUN_KWARGS: dict[str, Any] = {
@@ -59,12 +64,42 @@ DEFAULT_RUN_KWARGS: dict[str, Any] = {
     "ttc_debug": False,
     "ttc_enabled": True,
     "msa_enabled": True,
+    "stage": "full",
+    "artifacts_root": "artifacts",
+    "reuse_artifacts": True,
+    "train_steps": 200,
+    "train_lr": 5e-4,
+    "train_log_interval": 20,
+    "train_block_ids": (12, 14, 16),
+    "mask_dir": None,
+    "track_cache": None,
+    "use_gradient_checkpointing": True,
+    "det_track_weight": 1.0,
+    "det_use_cotracker": True,
+    "det_cotracker_grid_size": 24,
+    "det_cotracker_checkpoint": None,
+    "motiondirector_lora_rank": 8,
+    "motiondirector_lora_alpha": 8.0,
+    "temporal_scale": 1.0,
+    "spatial_scale": 0.0,
 }
+
+
+def resolve_model_paths(model_dir: str):
+    discover_model_paths = getattr(wan, "discover_model_paths", None)
+    if callable(discover_model_paths):
+        return discover_model_paths(model_dir)
+    get_model_paths = getattr(wan, "get_model_paths", None)
+    if callable(get_model_paths):
+        return get_model_paths(model_dir)
+    raise AttributeError(
+        "wan_14b_text_to_video must define either `discover_model_paths` or `get_model_paths`."
+    )
 
 
 def build_pipe(model_dir: str = wan.DEFAULT_MODEL_DIR) -> WanVideoPipeline:
     model_manager = ModelManager(device="cpu")
-    model_paths = wan.discover_model_paths(model_dir)
+    model_paths = resolve_model_paths(model_dir)
     model_manager.load_models(model_paths, torch_dtype=torch.bfloat16)
     pipe = WanVideoPipeline.from_model_manager(
         model_manager,
@@ -129,6 +164,8 @@ def parse_shell_metadata(shell_text: str) -> dict[str, Any]:
 
 def _resolve_run_label(kwargs: dict[str, Any]) -> str:
     transfer_method = normalize_transfer_method(kwargs.get("transfer_method"), kwargs.get("mode"))
+    if is_tuning_based_method(transfer_method):
+        return transfer_method
     if transfer_method == "fastvmt":
         if kwargs.get("ttc_enabled") and kwargs.get("msa_enabled"):
             return "fastvmt"
@@ -166,6 +203,19 @@ def run_case(
     if run_label is None:
         run_label = method_dir_name or transfer_method
     print(f"===== Running {case_id} / {run_label} =====")
+
+    if is_tuning_based_method(transfer_method):
+        tuning_output_dir = Path(output_dir)
+        metadata = run_tuning_case(
+            pipe,
+            case,
+            output_dir=tuning_output_dir,
+            denoising_strength=denoising_strength,
+            **kwargs,
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
+        return metadata
 
     input_video = VideoData(
         str(Path("data") / f"{ref}.mp4"),
@@ -245,6 +295,8 @@ def run_case(
         method=summary.get("transfer_method", transfer_method),
         model_variant=settings.get("model_variant", "Wan2.1-T2V-14B"),
         benchmark_preset=kwargs.get("benchmark_preset"),
+        method_family=get_method_family(transfer_method),
+        stage=kwargs.get("stage", "full"),
         extra={
             "case_id": case_id,
             "run_label": run_label,

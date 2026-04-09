@@ -1,0 +1,6 @@
+lightning
+peft
+accelerate
+opencv-python
+decord
+cotracker

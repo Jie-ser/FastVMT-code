@@ -9,9 +9,15 @@ from diffsynth import (
     ModelManager,
     VideoData,
     WanVideoPipeline,
+    save_video,
+    run_tuning_case,
+)
+from diffsynth.benchmarks import (
     apply_benchmark_settings,
     build_run_metadata,
-    save_video,
+    get_method_family,
+    is_tuning_based_method,
+    normalize_transfer_method,
     write_metadata,
 )
 
@@ -82,6 +88,55 @@ def main(args):
     pipe = WanVideoPipeline.from_model_manager(model_manager, torch_dtype=torch.bfloat16, device="cuda")
     pipe.enable_vram_management(num_persistent_param_in_dit=None)
 
+    if is_tuning_based_method(args.transfer_method):
+        case = {
+            "case_id": Path(args.input_video).stem,
+            "ref": Path(args.input_video).stem,
+            "ref_video_path": args.input_video,
+            "prompt": args.prompt,
+            "negative_prompt": args.negative_prompt,
+        }
+        metadata = run_tuning_case(
+            pipe,
+            case,
+            output_dir=args.output_dir,
+            denoising_strength=args.denoising_strength,
+            seed=args.seed,
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            num_inference_steps=args.num_inference_steps,
+            cfg_scale=5.8,
+            sigma_shift=7.0,
+            sf=args.sf,
+            mode=args.mode,
+            transfer_method=args.transfer_method,
+            benchmark_preset=args.benchmark_preset,
+            stage=args.stage,
+            artifacts_root=args.artifacts_root,
+            reuse_artifacts=args.reuse_artifacts,
+            train_steps=args.train_steps,
+            train_lr=args.train_lr,
+            train_block_ids=args.train_block_ids,
+            mask_dir=args.mask_dir,
+            track_cache=args.track_cache,
+            use_gradient_checkpointing=args.use_gradient_checkpointing,
+            det_track_weight=args.det_track_weight,
+            det_use_cotracker=args.det_use_cotracker,
+            det_cotracker_grid_size=args.det_cotracker_grid_size,
+            det_cotracker_checkpoint=args.det_cotracker_checkpoint,
+            motiondirector_lora_rank=args.motiondirector_lora_rank,
+            motiondirector_lora_alpha=args.motiondirector_lora_alpha,
+            temporal_scale=args.temporal_scale,
+            spatial_scale=args.spatial_scale,
+        )
+        stage_output = Path(metadata["output_path"])
+        if stage_output.suffix:
+            print(f"Tuning-based run completed: {stage_output}")
+        else:
+            print(f"Tuning-based stage `{args.stage}` completed: {stage_output}")
+        return
+
     input_video = VideoData(args.input_video, height=settings["height"], width=settings["width"])
     if args.benchmark_preset is not None:
         available_frames = len(input_video)
@@ -134,6 +189,9 @@ def main(args):
     save_video(frames, output_path, fps=15, quality=5)
 
     summary = pipe.last_run_summary or {}
+    resolved_method = summary.get("transfer_method")
+    if resolved_method is None:
+        resolved_method = normalize_transfer_method(args.transfer_method, args.mode)
     metadata = build_run_metadata(
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
@@ -144,9 +202,11 @@ def main(args):
         frames=summary.get("output_num_frames", summary.get("num_frames", len(frames))),
         height=summary.get("height", settings["height"]),
         width=summary.get("width", settings["width"]),
-        method=summary.get("transfer_method", args.transfer_method or args.mode or "fastvmt"),
+        method=resolved_method,
         model_variant=settings.get("model_variant", "Wan2.1-T2V-14B"),
         benchmark_preset=args.benchmark_preset,
+        method_family=get_method_family(args.transfer_method, args.mode),
+        stage=args.stage,
         extra={
             "requested_num_frames": summary.get("requested_num_frames", settings["num_frames"]),
             "decoded_num_frames": summary.get("decoded_num_frames", len(frames)),
@@ -171,7 +231,7 @@ if __name__ == "__main__":
         "--transfer_method",
         type=str,
         default=None,
-        choices=["fastvmt", "ditflow", "moft", "smm", "motionclone", "no_transfer"],
+        choices=["fastvmt", "ditflow", "moft", "smm", "motionclone", "no_transfer", "motioninversion", "motiondirector", "det"],
         help="Unified transfer method interface for Wan-native benchmark baselines",
     )
     parser.add_argument(
@@ -218,6 +278,23 @@ if __name__ == "__main__":
     parser.add_argument("--ttc_anchor_blend_end", type=float, default=0.12)
     parser.add_argument("--ttc_debug", action="store_true")
     parser.add_argument("--denoising_strength", type=float, default=0.75)
+    parser.add_argument("--stage", type=str, default="full", choices=["prepare", "train", "infer", "full"])
+    parser.add_argument("--artifacts_root", type=str, default="artifacts")
+    parser.add_argument("--reuse_artifacts", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--train_steps", type=int, default=200)
+    parser.add_argument("--train_lr", type=float, default=5e-4)
+    parser.add_argument("--train_block_ids", type=int, nargs="+", default=[12, 14, 16])
+    parser.add_argument("--mask_dir", type=str, default=None)
+    parser.add_argument("--track_cache", type=str, default=None)
+    parser.add_argument("--use_gradient_checkpointing", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--det_track_weight", type=float, default=1.0)
+    parser.add_argument("--det_use_cotracker", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--det_cotracker_grid_size", type=int, default=24)
+    parser.add_argument("--det_cotracker_checkpoint", type=str, default=None)
+    parser.add_argument("--motiondirector_lora_rank", type=int, default=8)
+    parser.add_argument("--motiondirector_lora_alpha", type=float, default=8.0)
+    parser.add_argument("--temporal_scale", type=float, default=1.0)
+    parser.add_argument("--spatial_scale", type=float, default=0.0)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)

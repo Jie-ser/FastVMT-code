@@ -23,12 +23,41 @@ BENCHMARK_PRESETS: dict[str, dict[str, Any]] = {
 }
 
 
+TRAINING_FREE_METHODS = {
+    "fastvmt",
+    "ditflow",
+    "moft",
+    "smm",
+    "motionclone",
+    "no_transfer",
+}
+
+TUNING_BASED_METHODS = {
+    "motioninversion",
+    "motiondirector",
+    "det",
+}
+
+TRANSFER_METHOD_FAMILIES = {
+    **{method: "training_free" for method in TRAINING_FREE_METHODS},
+    **{method: "tuning_based" for method in TUNING_BASED_METHODS},
+}
+
+TUNING_STAGES = {"prepare", "train", "infer", "full"}
+DEFAULT_TRAIN_BLOCK_IDS = (12, 14, 16)
+
+
 TRANSFER_METHOD_ALIASES = {
     "fastvmt": "fastvmt",
     "ditflow": "ditflow",
     "moft": "moft",
     "smm": "smm",
     "motionclone": "motionclone",
+    "motioninversion": "motioninversion",
+    "motion_inversion": "motioninversion",
+    "motiondirector": "motiondirector",
+    "motion_director": "motiondirector",
+    "det": "det",
     "no_transfer": "no_transfer",
     "baseline": "no_transfer",
 }
@@ -53,6 +82,46 @@ def normalize_transfer_method(transfer_method: str | None = None, mode: str | No
         supported = ", ".join(sorted(TRANSFER_METHOD_ALIASES))
         raise ValueError(f"Unsupported transfer_method `{transfer_method}`. Expected one of: {supported}.")
     return TRANSFER_METHOD_ALIASES[transfer_method]
+
+
+def get_method_family(transfer_method: str | None = None, mode: str | None = None) -> str:
+    normalized = normalize_transfer_method(transfer_method=transfer_method, mode=mode)
+    return TRANSFER_METHOD_FAMILIES[normalized]
+
+
+def is_tuning_based_method(transfer_method: str | None = None, mode: str | None = None) -> bool:
+    return get_method_family(transfer_method=transfer_method, mode=mode) == "tuning_based"
+
+
+def normalize_stage(stage: str | None = None) -> str:
+    if stage is None:
+        return "full"
+    stage = str(stage).strip().lower()
+    if stage not in TUNING_STAGES:
+        supported = ", ".join(sorted(TUNING_STAGES))
+        raise ValueError(f"Unsupported stage `{stage}`. Expected one of: {supported}.")
+    return stage
+
+
+def normalize_train_block_ids(
+    train_block_ids: list[int] | tuple[int, ...] | None = None,
+    *,
+    center: int = 14,
+    radius: int = 2,
+    num_layers: int | None = None,
+) -> tuple[int, ...]:
+    if train_block_ids is None:
+        train_block_ids = DEFAULT_TRAIN_BLOCK_IDS
+    unique = []
+    for block_id in train_block_ids:
+        block_id = int(block_id)
+        if num_layers is not None:
+            block_id = max(0, min(int(num_layers) - 1, block_id))
+        if block_id not in unique:
+            unique.append(block_id)
+    if not unique:
+        raise ValueError("train_block_ids resolved to an empty set.")
+    return tuple(unique)
 
 
 def resolve_benchmark_preset(benchmark_preset: str | None = None) -> dict[str, Any] | None:
@@ -120,6 +189,8 @@ def build_run_metadata(
     method: str,
     model_variant: str,
     benchmark_preset: str | None = None,
+    method_family: str | None = None,
+    stage: str | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {
@@ -138,6 +209,10 @@ def build_run_metadata(
     }
     if benchmark_preset is not None:
         metadata["benchmark_preset"] = str(benchmark_preset).strip().lower()
+    if method_family is not None:
+        metadata["method_family"] = str(method_family).strip().lower()
+    if stage is not None:
+        metadata["stage"] = str(stage).strip().lower()
     if extra:
         metadata.update(extra)
     return metadata
