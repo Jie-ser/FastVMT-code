@@ -66,10 +66,13 @@ def default_grid_size(height: int, width: int) -> tuple[int, int]:
 
 
 def build_size_info(height: int, width: int, num_frames: int, *, tiled: bool = True) -> dict[str, Any]:
+    internal_num_frames = int(num_frames)
+    if internal_num_frames % 4 != 1:
+        internal_num_frames = (internal_num_frames + 2) // 4 * 4 + 1
     return {
         "tiled": bool(tiled),
         "tile_size": default_grid_size(height, width),
-        "frames": (int(num_frames) - 1) // 4 + 1,
+        "frames": (internal_num_frames - 1) // 4 + 1,
     }
 
 

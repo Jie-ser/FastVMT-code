@@ -60,6 +60,9 @@ class MotionInversionAdapter(nn.Module):
         self._installed_pipe = None
 
     def _expand_frame_bias(self, bias: torch.Tensor, frames: int, spatial_tokens: int, *, device, dtype) -> torch.Tensor:
+        if bias.shape[0] < frames:
+            pad = bias[-1:].expand(frames - bias.shape[0], -1)
+            bias = torch.cat([bias, pad], dim=0)
         bias = bias[:frames].to(device=device, dtype=dtype)
         bias = bias.unsqueeze(1).expand(frames, spatial_tokens, bias.shape[-1])
         return rearrange(bias, "f s c -> 1 (f s) c")

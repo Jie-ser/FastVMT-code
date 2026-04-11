@@ -20,11 +20,19 @@ class LoRAWrappedLinear(nn.Module):
         self.lora_B = nn.Linear(self.rank, base.out_features, bias=False)
         nn.init.kaiming_uniform_(self.lora_A.weight, a=5**0.5)
         nn.init.zeros_(self.lora_B.weight)
+        self.lora_A.to(device=base.weight.device, dtype=base.weight.dtype)
+        self.lora_B.to(device=base.weight.device, dtype=base.weight.dtype)
         for param in self.base.parameters():
             param.requires_grad_(False)
 
     def forward(self, x):
-        return self.base(x) + self.path_scale * self.scaling * self.lora_B(self.lora_A(x))
+        base_out = self.base(x)
+        lora_dtype = self.lora_A.weight.dtype
+        lora_input = x if x.dtype == lora_dtype else x.to(dtype=lora_dtype)
+        lora_out = self.lora_B(self.lora_A(lora_input))
+        if lora_out.dtype != base_out.dtype:
+            lora_out = lora_out.to(dtype=base_out.dtype)
+        return base_out + self.path_scale * self.scaling * lora_out
 
 
 class MotionDirectorAdapter(nn.Module):

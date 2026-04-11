@@ -103,6 +103,8 @@ def train_tuning_method(
     train_log_interval = int(run_kwargs.get("train_log_interval", 20))
     size_info = build_size_info(settings["height"], settings["width"], settings["num_frames"])
     latents = load_shared_latents(bundle, device=pipe.device, dtype=pipe.torch_dtype)
+    if latents.ndim >= 3:
+        size_info["frames"] = int(latents.shape[2])
     pipe.scheduler.set_timesteps(
         settings["num_inference_steps"],
         denoising_strength=denoising_strength,
