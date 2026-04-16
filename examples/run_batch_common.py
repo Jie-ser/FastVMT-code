@@ -62,6 +62,22 @@ DEFAULT_RUN_KWARGS: dict[str, Any] = {
     "ttc_anchor_blend_start": 0.35,
     "ttc_anchor_blend_end": 0.85,
     "ttc_debug": False,
+    "corttc_enabled": False,
+    "corttc_noise_levels": (),
+    "corttc_step_ratios": (0.65, 0.50, 0.35, 0.20),
+    "corttc_topk": 8,
+    "corttc_window_size": 21,
+    "corttc_tau": 1.0,
+    "corttc_iter": 1,
+    "corttc_lr": 0.0015,
+    "corttc_corr_weight": 1.0,
+    "corttc_cycle_weight": 0.0,
+    "corttc_traj_weight": 0.0,
+    "corttc_stay_weight": 0.05,
+    "corttc_anchor_mode": "hybrid_corr",
+    "corttc_anchor_ref_weight": 0.25,
+    "corttc_mask_mode": "confidence",
+    "corttc_debug": False,
     "ttc_enabled": True,
     "msa_enabled": True,
     "stage": "full",
@@ -167,6 +183,10 @@ def _resolve_run_label(kwargs: dict[str, Any]) -> str:
     if is_tuning_based_method(transfer_method):
         return transfer_method
     if transfer_method == "fastvmt":
+        if kwargs.get("corttc_enabled") and kwargs.get("msa_enabled"):
+            return "corttc_msa"
+        if kwargs.get("corttc_enabled"):
+            return "corttc"
         if kwargs.get("ttc_enabled") and kwargs.get("msa_enabled"):
             return "fastvmt"
         if kwargs.get("ttc_enabled"):
@@ -263,6 +283,22 @@ def run_case(
         ttc_debug=kwargs["ttc_debug"],
         guidance_steps=kwargs["guidance_steps"],
         msa_enabled=kwargs["msa_enabled"],
+        corttc_enabled=kwargs["corttc_enabled"],
+        corttc_noise_levels=tuple(kwargs["corttc_noise_levels"]),
+        corttc_step_ratios=tuple(kwargs["corttc_step_ratios"]),
+        corttc_topk=kwargs["corttc_topk"],
+        corttc_window_size=kwargs["corttc_window_size"],
+        corttc_tau=kwargs["corttc_tau"],
+        corttc_iter=kwargs["corttc_iter"],
+        corttc_lr=kwargs["corttc_lr"],
+        corttc_corr_weight=kwargs["corttc_corr_weight"],
+        corttc_cycle_weight=kwargs["corttc_cycle_weight"],
+        corttc_traj_weight=kwargs["corttc_traj_weight"],
+        corttc_stay_weight=kwargs["corttc_stay_weight"],
+        corttc_anchor_mode=kwargs["corttc_anchor_mode"],
+        corttc_anchor_ref_weight=kwargs["corttc_anchor_ref_weight"],
+        corttc_mask_mode=kwargs["corttc_mask_mode"],
+        corttc_debug=kwargs["corttc_debug"],
         msa_optim_start=kwargs["msa_optim_start"],
         msa_optim_end=kwargs["msa_optim_end"],
         msa_iter=kwargs["msa_iter"],

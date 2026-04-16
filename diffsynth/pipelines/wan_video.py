@@ -731,6 +731,353 @@ class WanVideoPipeline(BasePipeline):
 
         return sorted(set(indices))
 
+    def _resolve_corttc_indices(
+        self,
+        timesteps,
+        corttc_noise_levels=(),
+        corttc_step_ratios=(0.65, 0.50, 0.35, 0.20),
+    ):
+        return self._resolve_ttc_indices(
+            timesteps,
+            ttc_noise_levels=corttc_noise_levels,
+            ttc_step_ratios=corttc_step_ratios,
+        )
+
+    def _get_corttc_window_buffers(self, h: int, w: int, window_size: int, device):
+        device = torch.device(device)
+        cache_key = (int(h), int(w), int(window_size), device.type, device.index)
+        if not hasattr(self, "_corttc_window_cache"):
+            self._corttc_window_cache = {}
+        if cache_key in self._corttc_window_cache:
+            return self._corttc_window_cache[cache_key]
+
+        half = int(window_size) // 2
+        spatial_positions = torch.arange(h * w, device=device)
+        base_y = spatial_positions // w
+        base_x = spatial_positions % w
+
+        offset_range = torch.arange(-half, half + 1, device=device)
+        offset_y, offset_x = torch.meshgrid(offset_range, offset_range, indexing="ij")
+        offset_y = offset_y.reshape(-1)
+        offset_x = offset_x.reshape(-1)
+
+        cand_y = base_y.unsqueeze(1) + offset_y.unsqueeze(0)
+        cand_x = base_x.unsqueeze(1) + offset_x.unsqueeze(0)
+        valid = (cand_y >= 0) & (cand_y < h) & (cand_x >= 0) & (cand_x < w)
+        linear_indices = cand_y.clamp(0, h - 1) * w + cand_x.clamp(0, w - 1)
+        offsets = torch.stack([offset_y.float(), offset_x.float()], dim=-1)
+
+        buffers = {
+            "indices": linear_indices.long(),
+            "valid": valid,
+            "offsets": offsets,
+        }
+        self._corttc_window_cache[cache_key] = buffers
+        return buffers
+
+    @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    def _compute_sparse_correspondence(
+        self,
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        topk: int = 8,
+        window_size: int = 21,
+        tau: float = 1.0,
+        support: dict = None,
+    ):
+        if Q is None or K is None:
+            raise ValueError("CorTTC requires captured q/k tensors, but got None.")
+        if Q.ndim == 5:
+            Q = Q[0]
+        if K.ndim == 5:
+            K = K[0]
+        if Q.ndim != 4 or K.ndim != 4:
+            raise ValueError("CorTTC expects q/k tensors with shape (frames, height, width, channels).")
+
+        frames, height, width, dim = Q.shape
+        if frames < 2:
+            raise ValueError("CorTTC requires at least two latent frames to build correspondence.")
+
+        spatial = height * width
+        q_flat = Q.reshape(frames, spatial, dim)
+        k_flat = K.reshape(frames, spatial, dim)
+        scale = math.sqrt(float(dim))
+        tau = float(max(1e-6, tau))
+
+        if support is None:
+            buffers = self._get_corttc_window_buffers(height, width, window_size, Q.device)
+            window_indices = buffers["indices"]
+            window_valid = buffers["valid"]
+            offsets = buffers["offsets"]
+            min_valid = int(window_valid.sum(dim=-1).amin().item())
+            topk = int(max(1, min(int(topk), min_valid)))
+        else:
+            if support["indices"].shape[0] != frames - 1:
+                raise ValueError("Reference support and generated q/k frame counts do not match.")
+            topk = int(support["indices"].shape[-1])
+
+        probs_all = []
+        scores_all = []
+        indices_all = []
+        offsets_all = []
+        confidence_all = []
+        margin_all = []
+        motion_mag_all = []
+
+        for frame_idx in range(frames - 1):
+            q_now = q_flat[frame_idx]
+            k_next = k_flat[frame_idx + 1]
+
+            if support is None:
+                local_indices = window_indices
+                local_valid = window_valid
+                k_candidates = k_next[local_indices]
+                scores = torch.sum(k_candidates * q_now.unsqueeze(1), dim=-1) / scale
+                scores = scores.masked_fill(~local_valid, float("-inf"))
+                topk_scores, topk_pos = torch.topk(scores, k=topk, dim=-1)
+                pair_indices = torch.gather(local_indices, 1, topk_pos)
+                pair_offset_y = torch.gather(
+                    offsets[:, 0].view(1, -1).expand(spatial, -1),
+                    1,
+                    topk_pos,
+                )
+                pair_offset_x = torch.gather(
+                    offsets[:, 1].view(1, -1).expand(spatial, -1),
+                    1,
+                    topk_pos,
+                )
+            else:
+                pair_indices = support["indices"][frame_idx].to(device=Q.device)
+                pair_offsets = support["offsets"][frame_idx].to(device=Q.device, dtype=torch.float32)
+                k_candidates = k_next[pair_indices]
+                topk_scores = torch.sum(k_candidates * q_now.unsqueeze(1), dim=-1) / scale
+                pair_offset_y = pair_offsets[..., 0]
+                pair_offset_x = pair_offsets[..., 1]
+
+            probs = F.softmax(topk_scores.float() / tau, dim=-1)
+            entropy = -(probs * torch.log(probs.clamp_min(1e-6))).sum(dim=-1)
+            if topk > 1:
+                confidence = 1.0 - entropy / math.log(float(topk))
+                margin = probs[:, 0] - probs[:, 1]
+            else:
+                confidence = torch.ones_like(entropy)
+                margin = torch.ones_like(entropy)
+
+            motion_y = torch.sum(probs * pair_offset_y.float(), dim=-1)
+            motion_x = torch.sum(probs * pair_offset_x.float(), dim=-1)
+            motion_mag = torch.sqrt(motion_y * motion_y + motion_x * motion_x)
+
+            probs_all.append(probs)
+            scores_all.append(topk_scores.float())
+            indices_all.append(pair_indices.long())
+            offsets_all.append(torch.stack([pair_offset_y.float(), pair_offset_x.float()], dim=-1))
+            confidence_all.append(confidence.clamp(0.0, 1.0))
+            margin_all.append(margin.clamp_min(0.0))
+            motion_mag_all.append(motion_mag)
+
+        return {
+            "probs": torch.stack(probs_all, dim=0),
+            "scores": torch.stack(scores_all, dim=0),
+            "indices": torch.stack(indices_all, dim=0),
+            "offsets": torch.stack(offsets_all, dim=0),
+            "confidence": torch.stack(confidence_all, dim=0),
+            "margin": torch.stack(margin_all, dim=0),
+            "motion_mag": torch.stack(motion_mag_all, dim=0),
+        }
+
+    def _build_corttc_mask(self, ref_corr: dict, corttc_mask_mode: str = "confidence"):
+        mode = str(corttc_mask_mode).strip().lower()
+        if mode in ["uniform", "none", "confidence", "confidence_first"]:
+            return torch.ones_like(ref_corr["confidence"], dtype=torch.float32, device=ref_corr["confidence"].device)
+        if mode in ["motion", "motion_aware", "motion_confidence"]:
+            motion_mag = ref_corr["motion_mag"].detach().float()
+            motion_mag = motion_mag / motion_mag.amax(dim=-1, keepdim=True).clamp_min(1e-6)
+            return motion_mag.clamp(0.0, 1.0)
+        raise ValueError(
+            "corttc_mask_mode must be one of: uniform, none, confidence, confidence_first, motion, motion_aware, motion_confidence"
+        )
+
+    def _compute_correspondence_loss(
+        self,
+        ref_corr: dict,
+        gen_corr: dict,
+        anchor_mode: str = "hybrid_corr",
+        anchor_ref_weight: float = 0.25,
+        initial_gen_probs: torch.Tensor = None,
+        corttc_mask_mode: str = "confidence",
+    ):
+        mode = str(anchor_mode).strip().lower()
+        alpha = float(max(0.0, min(1.0, anchor_ref_weight)))
+
+        ref_probs = ref_corr["probs"].detach().float()
+        gen_probs = gen_corr["probs"].float()
+
+        if mode == "ref_corr":
+            target_probs = ref_probs
+        elif mode == "hybrid_corr":
+            self_probs = initial_gen_probs.detach().float() if initial_gen_probs is not None else gen_probs.detach()
+            target_probs = alpha * ref_probs + (1.0 - alpha) * self_probs
+        elif mode == "residual_corr":
+            self_probs = gen_probs.detach()
+            target_probs = self_probs + alpha * (ref_probs - self_probs)
+        else:
+            raise ValueError("Invalid corttc_anchor_mode. Expected one of: ref_corr, hybrid_corr, residual_corr")
+
+        target_probs = target_probs.clamp_min(1e-6)
+        target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        confidence = ref_corr["confidence"].detach().float().clamp(0.0, 1.0)
+        mask = self._build_corttc_mask(ref_corr, corttc_mask_mode=corttc_mask_mode).float()
+        weights = (confidence * mask).clamp_min(0.0)
+
+        per_token_ce = -(target_probs * torch.log(gen_probs.clamp_min(1e-6))).sum(dim=-1)
+        loss = (per_token_ce * weights).sum() / weights.sum().clamp_min(1e-6)
+        stats = {
+            "weight_mean": float(weights.mean().item()),
+            "confidence_mean": float(confidence.mean().item()),
+            "motion_mean": float(ref_corr["motion_mag"].detach().float().mean().item()),
+        }
+        return loss, stats
+
+    def _corttc_pathwise_update(
+        self,
+        latents: torch.Tensor,
+        current_timestep: torch.Tensor,
+        next_timestep: torch.Tensor,
+        current_noise_pred: torch.Tensor,
+        prompt_emb_posi,
+        prompt_emb_nega,
+        prompt_null,
+        cfg_scale: float,
+        image_emb: dict,
+        extra_input: dict,
+        size_info: dict,
+        usp_kwargs: dict,
+        motion_kwargs: dict,
+        vace_kwargs: dict,
+        guidance_block_id: int = 14,
+        corttc_topk: int = 8,
+        corttc_window_size: int = 21,
+        corttc_tau: float = 1.0,
+        corttc_iter: int = 1,
+        corttc_lr: float = 0.0015,
+        corttc_corr_weight: float = 1.0,
+        corttc_stay_weight: float = 0.05,
+        corttc_anchor_mode: str = "hybrid_corr",
+        corttc_anchor_ref_weight: float = 0.25,
+        corttc_mask_mode: str = "confidence",
+        corttc_debug: bool = False,
+        rand_device: str = "cpu",
+    ):
+        x0_current = self.scheduler.step(current_noise_pred, current_timestep, latents, to_final=True)
+
+        noise_1 = self.generate_noise(latents.shape, device=rand_device, dtype=torch.float32)
+        noise_1 = noise_1.to(dtype=self.torch_dtype, device=self.device)
+        latents_next = self.scheduler.add_noise(x0_current, noise_1, timestep=next_timestep)
+        ref_latents_next = self.scheduler.add_noise(self.clean_latents, noise_1, timestep=next_timestep)
+
+        detached_prompt_emb_posi = {k: v.detach() if hasattr(v, "detach") else v for k, v in prompt_emb_posi.items()}
+        detached_prompt_null = {k: v.detach() if hasattr(v, "detach") else v for k, v in prompt_null.items()}
+
+        with torch.no_grad():
+            ref_state = self._extract_guidance_state(
+                ref_latents_next,
+                timestep=next_timestep,
+                prompt_kwargs=detached_prompt_null,
+                image_emb=image_emb,
+                extra_input=extra_input,
+                size_info=size_info,
+                block_id=guidance_block_id,
+            )
+            ref_corr = self._compute_sparse_correspondence(
+                ref_state["q"],
+                ref_state["k"],
+                topk=corttc_topk,
+                window_size=corttc_window_size,
+                tau=corttc_tau,
+                support=None,
+            )
+
+        optimized_latents = latents_next.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.AdamW([optimized_latents], lr=float(corttc_lr), weight_decay=0.0)
+        initial_gen_probs = None
+        device_type = torch.device(self.device).type
+
+        self.dit.train()
+        for param in self.dit.parameters():
+            param.requires_grad_(False)
+
+        total_steps = int(max(1, corttc_iter))
+        for iter_idx in range(total_steps):
+            optimizer.zero_grad(set_to_none=True)
+            with torch.enable_grad():
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    gen_state = self._extract_guidance_state(
+                        optimized_latents,
+                        timestep=next_timestep,
+                        prompt_kwargs=detached_prompt_emb_posi,
+                        image_emb=image_emb,
+                        extra_input=extra_input,
+                        size_info=size_info,
+                        block_id=guidance_block_id,
+                    )
+                    gen_corr = self._compute_sparse_correspondence(
+                        gen_state["q"],
+                        gen_state["k"],
+                        topk=corttc_topk,
+                        window_size=corttc_window_size,
+                        tau=corttc_tau,
+                        support=ref_corr,
+                    )
+                    if initial_gen_probs is None:
+                        initial_gen_probs = gen_corr["probs"].detach()
+                    corr_loss, corr_stats = self._compute_correspondence_loss(
+                        ref_corr=ref_corr,
+                        gen_corr=gen_corr,
+                        anchor_mode=corttc_anchor_mode,
+                        anchor_ref_weight=corttc_anchor_ref_weight,
+                        initial_gen_probs=initial_gen_probs,
+                        corttc_mask_mode=corttc_mask_mode,
+                    )
+                    stay_loss = F.mse_loss(optimized_latents.float(), latents_next.detach().float())
+                    loss = float(corttc_corr_weight) * corr_loss + float(corttc_stay_weight) * stay_loss
+
+            loss.backward()
+            optimizer.step()
+
+            if corttc_debug:
+                print(
+                    f"CorTTC iter={iter_idx + 1}/{total_steps}: "
+                    f"corr={float(corr_loss.detach().item()):.6f}, "
+                    f"stay={float(stay_loss.detach().item()):.6f}, "
+                    f"weight_mean={corr_stats['weight_mean']:.4f}, "
+                    f"conf_mean={corr_stats['confidence_mean']:.4f}, "
+                    f"motion_mean={corr_stats['motion_mean']:.4f}"
+                )
+
+        latents_corr = optimized_latents.detach()
+        noise_pred_posi = model_fn_wan_video(
+            self.dit, motion_controller=self.motion_controller, vace=self.vace,
+            x=latents_corr, timestep=next_timestep, size_info=size_info,
+            **prompt_emb_posi, **image_emb, **extra_input,
+            tea_cache=None, **usp_kwargs, **motion_kwargs, **vace_kwargs,
+        )
+        if cfg_scale != 1.0:
+            noise_pred_nega = model_fn_wan_video(
+                self.dit, motion_controller=self.motion_controller, vace=self.vace,
+                x=latents_corr, timestep=next_timestep, size_info=size_info,
+                **prompt_emb_nega, **image_emb, **extra_input,
+                tea_cache=None, **usp_kwargs, **motion_kwargs, **vace_kwargs,
+            )
+            noise_pred_corr = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
+        else:
+            noise_pred_corr = noise_pred_posi
+
+        x0_corr = self.scheduler.step(noise_pred_corr, next_timestep, latents_corr, to_final=True)
+        noise_2 = self.generate_noise(latents.shape, device=rand_device, dtype=torch.float32)
+        noise_2 = noise_2.to(dtype=self.torch_dtype, device=self.device)
+        return self.scheduler.add_noise(x0_corr, noise_2, timestep=next_timestep)
+
     def _get_ttc_anchor(
         self,
         ttc_anchor_clean,
@@ -1104,6 +1451,22 @@ class WanVideoPipeline(BasePipeline):
         ttc_anchor_blend_start=None,
         ttc_anchor_blend_end=None,
         ttc_debug=False,
+        corttc_enabled=False,
+        corttc_noise_levels=(),
+        corttc_step_ratios=(0.65, 0.50, 0.35, 0.20),
+        corttc_topk=8,
+        corttc_window_size=21,
+        corttc_tau=1.0,
+        corttc_iter=1,
+        corttc_lr=0.0015,
+        corttc_corr_weight=1.0,
+        corttc_cycle_weight=0.0,
+        corttc_traj_weight=0.0,
+        corttc_stay_weight=0.05,
+        corttc_anchor_mode="hybrid_corr",
+        corttc_anchor_ref_weight=0.25,
+        corttc_mask_mode="confidence",
+        corttc_debug=False,
         guidance_steps=10,
         msa_enabled=False,
         msa_optim_start=0,
@@ -1160,13 +1523,50 @@ class WanVideoPipeline(BasePipeline):
         msa_balance_with_amf = bool(msa_balance_with_amf)
         msa_enabled = bool(msa_enabled)
         msa_scale_list = tuple(float(scale) for scale in msa_scale_list)
+        corttc_enabled = bool(corttc_enabled)
+        corttc_noise_levels = tuple(float(level) for level in corttc_noise_levels)
+        corttc_step_ratios = tuple(float(ratio) for ratio in corttc_step_ratios)
+        corttc_topk = int(max(1, corttc_topk))
+        corttc_window_size = int(max(3, corttc_window_size))
+        if corttc_window_size % 2 == 0:
+            corttc_window_size += 1
+        corttc_tau = float(max(1e-3, corttc_tau))
+        corttc_iter = int(max(1, corttc_iter))
+        corttc_lr = float(max(1e-6, corttc_lr))
+        corttc_corr_weight = float(max(0.0, corttc_corr_weight))
+        corttc_cycle_weight = float(max(0.0, corttc_cycle_weight))
+        corttc_traj_weight = float(max(0.0, corttc_traj_weight))
+        corttc_stay_weight = float(max(0.0, corttc_stay_weight))
+        corttc_anchor_ref_weight = float(max(0.0, min(1.0, corttc_anchor_ref_weight)))
+        corttc_anchor_mode = str(corttc_anchor_mode).strip().lower()
+        if corttc_anchor_mode not in ["ref_corr", "hybrid_corr", "residual_corr"]:
+            raise ValueError("corttc_anchor_mode must be one of: ref_corr, hybrid_corr, residual_corr")
+        corttc_mask_mode = str(corttc_mask_mode).strip().lower()
+        if corttc_mask_mode not in [
+            "uniform",
+            "none",
+            "confidence",
+            "confidence_first",
+            "motion",
+            "motion_aware",
+            "motion_confidence",
+        ]:
+            raise ValueError(
+                "corttc_mask_mode must be one of: uniform, none, confidence, confidence_first, motion, motion_aware, motion_confidence"
+            )
 
         if transfer_method != "fastvmt" and ttc_enabled:
             print(f"TTC is disabled because transfer_method='{transfer_method}' does not use FastVMT path correction.")
             ttc_enabled = False
+        if transfer_method != "fastvmt" and corttc_enabled:
+            print(f"CorTTC is disabled because transfer_method='{transfer_method}' does not use FastVMT correspondence guidance.")
+            corttc_enabled = False
         if transfer_method != "fastvmt" and msa_enabled:
             print(f"MSA is disabled because transfer_method='{transfer_method}' does not use FastVMT structure anchoring.")
             msa_enabled = False
+        if corttc_enabled and ttc_enabled:
+            print("Legacy TTC is disabled because CorTTC is enabled and both pathwise correction modes should not run together.")
+            ttc_enabled = False
 
         if msa_enabled and transfer_method == "no_transfer":
             print("MSA is disabled because `transfer_method='no_transfer'`.")
@@ -1177,6 +1577,18 @@ class WanVideoPipeline(BasePipeline):
         if msa_enabled and input_video is None:
             print("MSA is disabled because reference `input_video` is required for MSA anchor.")
             msa_enabled = False
+        if corttc_enabled and input_video is None:
+            print("CorTTC is disabled because reference `input_video` is required for correspondence anchor.")
+            corttc_enabled = False
+        if corttc_enabled and corttc_debug:
+            print(
+                f"CorTTC config: iter={corttc_iter}, topk={corttc_topk}, window={corttc_window_size}, "
+                f"tau={corttc_tau}, anchor={corttc_anchor_mode}, mask={corttc_mask_mode}, "
+                f"corr_weight={corttc_corr_weight}, stay_weight={corttc_stay_weight}, "
+                f"ratios={corttc_step_ratios}, noise_levels={corttc_noise_levels}"
+            )
+        if corttc_enabled and (corttc_cycle_weight > 0.0 or corttc_traj_weight > 0.0):
+            print("CorTTC v1 currently applies only correspondence + stay losses; cycle/traj weights are reserved and ignored.")
 
         max_guidance_index = max(0, int(guidance_steps) - 1)
         msa_optim_start = int(max(0, msa_optim_start))
@@ -1307,6 +1719,7 @@ class WanVideoPipeline(BasePipeline):
         usp_kwargs = self.prepare_unified_sequence_parallel()
         # Default empty set keeps TTC branch disabled unless explicitly enabled and resolved below.
         ttc_indices = set()
+        corttc_indices = set()
         # New TTC blend schedule with backward-compatible fallback to legacy single blend.
         ttc_blend_start = ttc_anchor_blend if ttc_anchor_blend_start is None else float(ttc_anchor_blend_start)
         ttc_blend_end = ttc_blend_start if ttc_anchor_blend_end is None else float(ttc_anchor_blend_end)
@@ -1323,6 +1736,17 @@ class WanVideoPipeline(BasePipeline):
                     f"TTC anchor config: mode={ttc_anchor_mode}, ref_weight={ttc_anchor_ref_weight}, "
                     f"blend_start={ttc_blend_start}, blend_end={ttc_blend_end}"
                 )
+        if corttc_enabled and transfer_method == "fastvmt":
+            corttc_indices = set(
+                self._resolve_corttc_indices(
+                    self.scheduler.timesteps,
+                    corttc_noise_levels=corttc_noise_levels,
+                    corttc_step_ratios=corttc_step_ratios,
+                )
+            )
+            if corttc_debug:
+                resolved_timesteps = [float(self.scheduler.timesteps[i].item()) for i in sorted(corttc_indices)]
+                print(f"CorTTC enabled. Step indices: {sorted(corttc_indices)}, timesteps: {resolved_timesteps}")
 
 
         #start_event = torch.cuda.Event(enable_timing=True)
@@ -1339,6 +1763,8 @@ class WanVideoPipeline(BasePipeline):
             ttc_anchor_clean = None
             ttc_total_hits = len(ttc_indices)
             ttc_hit_count = 0
+            corttc_total_hits = len(corttc_indices)
+            corttc_hit_count = 0
             if test_latency:
                 start_event_guidance = [torch.cuda.Event(enable_timing=True) for _ in range(10)]
                 start_event_gen = torch.cuda.Event(enable_timing=True)
@@ -1431,6 +1857,53 @@ class WanVideoPipeline(BasePipeline):
                     noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
                 else:
                     noise_pred = noise_pred_posi
+
+                if (
+                    corttc_enabled
+                    and transfer_method == "fastvmt"
+                    and progress_id in corttc_indices
+                    and progress_id + 1 < len(self.scheduler.timesteps)
+                ):
+                    next_timestep = self.scheduler.timesteps[progress_id + 1].unsqueeze(0).to(
+                        dtype=self.torch_dtype,
+                        device=self.device,
+                    )
+                    if corttc_debug:
+                        print(
+                            f"CorTTC hit {corttc_hit_count + 1}/{corttc_total_hits} at step={progress_id}, "
+                            f"t={float(self.scheduler.timesteps[progress_id].item()):.4f}"
+                        )
+                    latents = self._corttc_pathwise_update(
+                        latents=latents,
+                        current_timestep=timestep,
+                        next_timestep=next_timestep,
+                        current_noise_pred=noise_pred,
+                        prompt_emb_posi=prompt_emb_posi,
+                        prompt_emb_nega=prompt_emb_nega,
+                        prompt_null=prompt_null,
+                        cfg_scale=cfg_scale,
+                        image_emb=image_emb,
+                        extra_input=extra_input,
+                        size_info=size_info,
+                        usp_kwargs=usp_kwargs,
+                        motion_kwargs=motion_kwargs,
+                        vace_kwargs=vace_kwargs,
+                        guidance_block_id=guidance_block_id,
+                        corttc_topk=corttc_topk,
+                        corttc_window_size=corttc_window_size,
+                        corttc_tau=corttc_tau,
+                        corttc_iter=corttc_iter,
+                        corttc_lr=corttc_lr,
+                        corttc_corr_weight=corttc_corr_weight,
+                        corttc_stay_weight=corttc_stay_weight,
+                        corttc_anchor_mode=corttc_anchor_mode,
+                        corttc_anchor_ref_weight=corttc_anchor_ref_weight,
+                        corttc_mask_mode=corttc_mask_mode,
+                        corttc_debug=corttc_debug,
+                        rand_device=rand_device,
+                    )
+                    corttc_hit_count += 1
+                    continue
 
                 if ttc_enabled and transfer_method == "fastvmt" and progress_id in ttc_indices and progress_id + 1 < len(self.scheduler.timesteps):
                     if ttc_total_hits <= 1:
