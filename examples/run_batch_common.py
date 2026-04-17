@@ -41,7 +41,7 @@ DEFAULT_RUN_KWARGS: dict[str, Any] = {
     "sigma_shift": 7.0,
     "mode": "effi_AMF",
     "transfer_method": "fastvmt",
-    "benchmark_preset": "wan14b_32f_832x480",
+    "benchmark_preset": None,
     "group_by_method": True,
     "sf": 4,
     "guidance_steps": 10,
@@ -54,30 +54,21 @@ DEFAULT_RUN_KWARGS: dict[str, Any] = {
     "msa_mask_min": 0.15,
     "msa_balance_with_amf": True,
     "msa_debug": False,
-    "ttc_noise_levels": (500, 250),
-    "ttc_step_ratios": (0.5, 0.25),
-    "ttc_anchor_blend": 1.0,
-    "ttc_anchor_mode": "hybrid",
+    "ttc_noise_levels": (),
+    "ttc_step_ratios": (0.65, 0.50, 0.35, 0.20),
+    "ttc_topk": 8,
+    "ttc_window_size": 21,
+    "ttc_tau": 1.0,
+    "ttc_iter": 1,
+    "ttc_lr": 0.0015,
+    "ttc_corr_weight": 1.0,
+    "ttc_cycle_weight": 0.0,
+    "ttc_traj_weight": 0.0,
+    "ttc_stay_weight": 0.05,
+    "ttc_anchor_mode": "hybrid_corr",
     "ttc_anchor_ref_weight": 0.25,
-    "ttc_anchor_blend_start": 0.35,
-    "ttc_anchor_blend_end": 0.85,
+    "ttc_mask_mode": "confidence",
     "ttc_debug": False,
-    "corttc_enabled": False,
-    "corttc_noise_levels": (),
-    "corttc_step_ratios": (0.65, 0.50, 0.35, 0.20),
-    "corttc_topk": 8,
-    "corttc_window_size": 21,
-    "corttc_tau": 1.0,
-    "corttc_iter": 1,
-    "corttc_lr": 0.0015,
-    "corttc_corr_weight": 1.0,
-    "corttc_cycle_weight": 0.0,
-    "corttc_traj_weight": 0.0,
-    "corttc_stay_weight": 0.05,
-    "corttc_anchor_mode": "hybrid_corr",
-    "corttc_anchor_ref_weight": 0.25,
-    "corttc_mask_mode": "confidence",
-    "corttc_debug": False,
     "ttc_enabled": True,
     "msa_enabled": True,
     "stage": "full",
@@ -183,10 +174,6 @@ def _resolve_run_label(kwargs: dict[str, Any]) -> str:
     if is_tuning_based_method(transfer_method):
         return transfer_method
     if transfer_method == "fastvmt":
-        if kwargs.get("corttc_enabled") and kwargs.get("msa_enabled"):
-            return "corttc_msa"
-        if kwargs.get("corttc_enabled"):
-            return "corttc"
         if kwargs.get("ttc_enabled") and kwargs.get("msa_enabled"):
             return "fastvmt"
         if kwargs.get("ttc_enabled"):
@@ -207,6 +194,7 @@ def run_case(
     run_label = run_kwargs.pop("run_label", None)
     kwargs = dict(DEFAULT_RUN_KWARGS)
     kwargs.update(run_kwargs)
+    input_root = Path(kwargs.pop("input_root", "data"))
 
     settings = apply_benchmark_settings(
         height=kwargs["height"],
@@ -237,8 +225,9 @@ def run_case(
         torch.cuda.empty_cache()
         return metadata
 
+    input_video_path = input_root / f"{ref}.mp4"
     input_video = VideoData(
-        str(Path("data") / f"{ref}.mp4"),
+        str(input_video_path),
         height=settings["height"],
         width=settings["width"],
     )
@@ -275,30 +264,21 @@ def run_case(
         ttc_enabled=kwargs["ttc_enabled"],
         ttc_noise_levels=tuple(kwargs["ttc_noise_levels"]),
         ttc_step_ratios=tuple(kwargs["ttc_step_ratios"]),
-        ttc_anchor_blend=kwargs["ttc_anchor_blend"],
+        ttc_topk=kwargs["ttc_topk"],
+        ttc_window_size=kwargs["ttc_window_size"],
+        ttc_tau=kwargs["ttc_tau"],
+        ttc_iter=kwargs["ttc_iter"],
+        ttc_lr=kwargs["ttc_lr"],
+        ttc_corr_weight=kwargs["ttc_corr_weight"],
+        ttc_cycle_weight=kwargs["ttc_cycle_weight"],
+        ttc_traj_weight=kwargs["ttc_traj_weight"],
+        ttc_stay_weight=kwargs["ttc_stay_weight"],
         ttc_anchor_mode=kwargs["ttc_anchor_mode"],
         ttc_anchor_ref_weight=kwargs["ttc_anchor_ref_weight"],
-        ttc_anchor_blend_start=kwargs["ttc_anchor_blend_start"],
-        ttc_anchor_blend_end=kwargs["ttc_anchor_blend_end"],
+        ttc_mask_mode=kwargs["ttc_mask_mode"],
         ttc_debug=kwargs["ttc_debug"],
         guidance_steps=kwargs["guidance_steps"],
         msa_enabled=kwargs["msa_enabled"],
-        corttc_enabled=kwargs["corttc_enabled"],
-        corttc_noise_levels=tuple(kwargs["corttc_noise_levels"]),
-        corttc_step_ratios=tuple(kwargs["corttc_step_ratios"]),
-        corttc_topk=kwargs["corttc_topk"],
-        corttc_window_size=kwargs["corttc_window_size"],
-        corttc_tau=kwargs["corttc_tau"],
-        corttc_iter=kwargs["corttc_iter"],
-        corttc_lr=kwargs["corttc_lr"],
-        corttc_corr_weight=kwargs["corttc_corr_weight"],
-        corttc_cycle_weight=kwargs["corttc_cycle_weight"],
-        corttc_traj_weight=kwargs["corttc_traj_weight"],
-        corttc_stay_weight=kwargs["corttc_stay_weight"],
-        corttc_anchor_mode=kwargs["corttc_anchor_mode"],
-        corttc_anchor_ref_weight=kwargs["corttc_anchor_ref_weight"],
-        corttc_mask_mode=kwargs["corttc_mask_mode"],
-        corttc_debug=kwargs["corttc_debug"],
         msa_optim_start=kwargs["msa_optim_start"],
         msa_optim_end=kwargs["msa_optim_end"],
         msa_iter=kwargs["msa_iter"],
@@ -321,7 +301,7 @@ def run_case(
     metadata = build_run_metadata(
         prompt=case["prompt"],
         negative_prompt=case["negative_prompt"],
-        ref_video=str(Path("data") / f"{ref}.mp4"),
+        ref_video=str(input_video_path),
         output_path=output_path,
         seed=kwargs["seed"],
         steps=summary.get("num_inference_steps", settings["num_inference_steps"]),

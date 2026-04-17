@@ -167,28 +167,19 @@ def main(args):
         ttc_enabled=args.ttc_enabled,
         ttc_noise_levels=tuple(args.ttc_noise_levels),
         ttc_step_ratios=tuple(args.ttc_step_ratios),
-        ttc_anchor_blend=args.ttc_anchor_blend,
+        ttc_topk=args.ttc_topk,
+        ttc_window_size=args.ttc_window_size,
+        ttc_tau=args.ttc_tau,
+        ttc_iter=args.ttc_iter,
+        ttc_lr=args.ttc_lr,
+        ttc_corr_weight=args.ttc_corr_weight,
+        ttc_cycle_weight=args.ttc_cycle_weight,
+        ttc_traj_weight=args.ttc_traj_weight,
+        ttc_stay_weight=args.ttc_stay_weight,
         ttc_anchor_mode=args.ttc_anchor_mode,
         ttc_anchor_ref_weight=args.ttc_anchor_ref_weight,
-        ttc_anchor_blend_start=args.ttc_anchor_blend_start,
-        ttc_anchor_blend_end=args.ttc_anchor_blend_end,
+        ttc_mask_mode=args.ttc_mask_mode,
         ttc_debug=args.ttc_debug,
-        corttc_enabled=args.corttc_enabled,
-        corttc_noise_levels=tuple(args.corttc_noise_levels),
-        corttc_step_ratios=tuple(args.corttc_step_ratios),
-        corttc_topk=args.corttc_topk,
-        corttc_window_size=args.corttc_window_size,
-        corttc_tau=args.corttc_tau,
-        corttc_iter=args.corttc_iter,
-        corttc_lr=args.corttc_lr,
-        corttc_corr_weight=args.corttc_corr_weight,
-        corttc_cycle_weight=args.corttc_cycle_weight,
-        corttc_traj_weight=args.corttc_traj_weight,
-        corttc_stay_weight=args.corttc_stay_weight,
-        corttc_anchor_mode=args.corttc_anchor_mode,
-        corttc_anchor_ref_weight=args.corttc_anchor_ref_weight,
-        corttc_mask_mode=args.corttc_mask_mode,
-        corttc_debug=args.corttc_debug,
         guidance_steps=args.guidance_steps,
         msa_enabled=args.msa_enabled,
         msa_optim_start=args.msa_optim_start,
@@ -280,45 +271,31 @@ if __name__ == "__main__":
     parser.add_argument("--msa_balance_with_amf", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--msa_debug", action="store_true")
     parser.add_argument("--ttc_enabled", action="store_true")
-    parser.add_argument("--ttc_noise_levels", type=int, nargs="+", default=[500, 250])
-    parser.add_argument("--ttc_step_ratios", type=float, nargs="+", default=[0.5, 0.25])
-    parser.add_argument("--ttc_anchor_blend", type=float, default=1.0)
+    parser.add_argument("--ttc_noise_levels", type=float, nargs="+", default=[])
+    parser.add_argument("--ttc_step_ratios", type=float, nargs="+", default=[0.65, 0.50, 0.35, 0.20])
+    parser.add_argument("--ttc_topk", type=int, default=8)
+    parser.add_argument("--ttc_window_size", type=int, default=21)
+    parser.add_argument("--ttc_tau", type=float, default=1.0)
+    parser.add_argument("--ttc_iter", type=int, default=1)
+    parser.add_argument("--ttc_lr", type=float, default=0.0015)
+    parser.add_argument("--ttc_corr_weight", type=float, default=1.0)
+    parser.add_argument("--ttc_cycle_weight", type=float, default=0.0)
+    parser.add_argument("--ttc_traj_weight", type=float, default=0.0)
+    parser.add_argument("--ttc_stay_weight", type=float, default=0.05)
     parser.add_argument(
         "--ttc_anchor_mode",
         type=str,
-        default="hybrid",
-        choices=["legacy_input_clean", "pred_x0", "hybrid"],
+        default="hybrid_corr",
+        choices=["ref_corr", "hybrid_corr", "residual_corr", "hybrid"],
     )
     parser.add_argument("--ttc_anchor_ref_weight", type=float, default=0.25)
-    parser.add_argument("--ttc_anchor_blend_start", type=float, default=0.35)
-    parser.add_argument("--ttc_anchor_blend_end", type=float, default=0.12)
-    parser.add_argument("--ttc_debug", action="store_true")
-    parser.add_argument("--corttc_enabled", action="store_true")
-    parser.add_argument("--corttc_noise_levels", type=float, nargs="+", default=[])
-    parser.add_argument("--corttc_step_ratios", type=float, nargs="+", default=[0.65, 0.50, 0.35, 0.20])
-    parser.add_argument("--corttc_topk", type=int, default=8)
-    parser.add_argument("--corttc_window_size", type=int, default=21)
-    parser.add_argument("--corttc_tau", type=float, default=1.0)
-    parser.add_argument("--corttc_iter", type=int, default=1)
-    parser.add_argument("--corttc_lr", type=float, default=0.0015)
-    parser.add_argument("--corttc_corr_weight", type=float, default=1.0)
-    parser.add_argument("--corttc_cycle_weight", type=float, default=0.0)
-    parser.add_argument("--corttc_traj_weight", type=float, default=0.0)
-    parser.add_argument("--corttc_stay_weight", type=float, default=0.05)
     parser.add_argument(
-        "--corttc_anchor_mode",
-        type=str,
-        default="hybrid_corr",
-        choices=["ref_corr", "hybrid_corr", "residual_corr"],
-    )
-    parser.add_argument("--corttc_anchor_ref_weight", type=float, default=0.25)
-    parser.add_argument(
-        "--corttc_mask_mode",
+        "--ttc_mask_mode",
         type=str,
         default="confidence",
         choices=["uniform", "none", "confidence", "confidence_first", "motion", "motion_aware", "motion_confidence"],
     )
-    parser.add_argument("--corttc_debug", action="store_true")
+    parser.add_argument("--ttc_debug", action="store_true")
     parser.add_argument("--denoising_strength", type=float, default=0.75)
     parser.add_argument("--stage", type=str, default="full", choices=["prepare", "train", "infer", "full"])
     parser.add_argument("--artifacts_root", type=str, default="artifacts")
