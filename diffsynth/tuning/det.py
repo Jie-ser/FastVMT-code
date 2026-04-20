@@ -34,9 +34,14 @@ class TemporalDepthwiseKernel(nn.Module):
     def forward(self, x: torch.Tensor, *, frames: int, grid_h: int, grid_w: int) -> torch.Tensor:
         batch = x.shape[0]
         seq = rearrange(x, "b (f h w) c -> (b h w) c f", f=frames, h=grid_h, w=grid_w)
-        filtered = self.conv(seq)
+        conv_dtype = self.conv.weight.dtype
+        conv_input = seq if seq.dtype == conv_dtype else seq.to(dtype=conv_dtype)
+        filtered = self.conv(conv_input)
+        if filtered.dtype != x.dtype:
+            filtered = filtered.to(dtype=x.dtype)
         filtered = rearrange(filtered, "(b h w) c f -> b (f h w) c", b=batch, h=grid_h, w=grid_w)
-        return x + self.residual_scale * filtered
+        residual_scale = self.residual_scale if self.residual_scale.dtype == x.dtype else self.residual_scale.to(dtype=x.dtype)
+        return x + residual_scale * filtered
 
 
 class DeTAdapter(nn.Module):
@@ -48,14 +53,14 @@ class DeTAdapter(nn.Module):
         self.block_ids = resolve_train_block_ids(train_block_ids, pipe=pipe)
         self.block_index = {block_id: idx for idx, block_id in enumerate(self.block_ids)}
         self.kernels = nn.ModuleList([TemporalDepthwiseKernel(pipe.dit.dim) for _ in self.block_ids])
-        self._installed_pipe = None
+        object.__setattr__(self, "_installed_pipe", None)
         self._original_forwards: dict[int, object] = {}
 
     def install(self, pipe, *, inference_mode: bool = False) -> None:
         del inference_mode
         if self._installed_pipe is pipe:
             return
-        self._installed_pipe = pipe
+        object.__setattr__(self, "_installed_pipe", pipe)
         for block_id in self.block_ids:
             block = pipe.dit.blocks[block_id]
             self._original_forwards[block_id] = block.forward
@@ -78,17 +83,17 @@ class DeTAdapter(nn.Module):
         for block_id in self.block_ids:
             self._installed_pipe.dit.blocks[block_id].forward = self._original_forwards[block_id]
         self._original_forwards.clear()
-        self._installed_pipe = None
+        object.__setattr__(self, "_installed_pipe", None)
 
     def save(self, artifact_dir) -> dict[str, str]:
         kernel_path = Path(artifact_dir) / "temporal_kernel.safetensors"
-        save_tensor_artifact(kernel_path, self.state_dict())
+        save_tensor_artifact(kernel_path, self.kernels.state_dict())
         return {"temporal_kernel": str(kernel_path)}
 
     def load(self, artifact_dir, *, device, dtype) -> dict[str, str]:
         kernel_path = Path(artifact_dir) / "temporal_kernel.safetensors"
         state_dict = load_tensor_artifact(kernel_path, device=device, dtype=dtype)
-        self.load_state_dict(state_dict, strict=True)
+        self.kernels.load_state_dict(state_dict, strict=True)
         return {"temporal_kernel": str(kernel_path)}
 
     def compute_track_loss(
